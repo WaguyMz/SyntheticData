@@ -24,6 +24,7 @@ impl Extractor for SchemaExtractor {
     ) -> FingerprintResult<ExtractedComponent> {
         let schema = match data {
             DataSource::Csv(csv) => extract_from_csv(csv, config, privacy)?,
+            DataSource::Fec(fec) => extract_from_csv(&fec.as_csv(), config, privacy)?,
             DataSource::Parquet(pq) => extract_from_parquet(pq, config, privacy)?,
             DataSource::Json(json) => extract_from_json(json, config, privacy)?,
             DataSource::Memory(mem) => extract_from_memory(mem, config, privacy)?,

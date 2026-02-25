@@ -16,7 +16,7 @@ use datasynth_core::memory_guard::{MemoryGuard, MemoryGuardConfig};
 use datasynth_core::models::{CoAComplexity, IndustrySector};
 use datasynth_fingerprint::{
     evaluation::FidelityEvaluator,
-    extraction::{CsvDataSource, DataSource, ExtractionConfig, FingerprintExtractor},
+    extraction::{CsvDataSource, DataSource, ExtractionConfig, FecDataSource, FingerprintExtractor},
     io::{validate_dsf, FingerprintReader, FingerprintWriter},
     models::PrivacyLevel,
     privacy::PrivacyConfig,
@@ -163,13 +163,17 @@ enum Commands {
 enum FingerprintCommands {
     /// Extract fingerprint from data
     Extract {
-        /// Input data path (CSV file or directory)
+        /// Input data path (CSV, FEC file, or directory)
         #[arg(short, long)]
         input: PathBuf,
 
         /// Output fingerprint file (.dsf)
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Input format: csv, fec, or auto (detect from extension)
+        #[arg(long, default_value = "auto")]
+        format: String,
 
         /// Privacy level (minimal, standard, high, maximum)
         #[arg(long, default_value = "standard")]
@@ -1413,6 +1417,7 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
         FingerprintCommands::Extract {
             input,
             output,
+            format,
             privacy_level,
             privacy_epsilon,
             privacy_k,
@@ -1446,24 +1451,32 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
                 ..Default::default()
             };
 
-            // Create data source
+            // Create data source (single file: CSV or FEC; directory: auto-detect formats)
             let data_source = if input.is_file() {
-                DataSource::Csv(CsvDataSource::new(input.clone()))
-            } else {
-                // For directories, find CSV files
-                let csv_files: Vec<_> = std::fs::read_dir(&input)?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "csv"))
-                    .collect();
-
-                if csv_files.is_empty() {
-                    anyhow::bail!("No CSV files found in directory: {}", input.display());
+                let use_fec = match format.to_lowercase().as_str() {
+                    "fec" => true,
+                    "csv" => false,
+                    "auto" => input
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("fec"))
+                        .unwrap_or(false),
+                    _ => input
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("fec"))
+                        .unwrap_or(false),
+                };
+                if use_fec {
+                    tracing::info!("Using FEC (Fichier des Écritures Comptables) as input");
+                    DataSource::Fec(FecDataSource::new(input.clone()))
+                } else {
+                    DataSource::Csv(CsvDataSource::new(input.clone()))
                 }
-
-                // Use first CSV file for now (multi-table support would require more logic)
-                let first_csv = csv_files[0].path();
-                tracing::info!("Using CSV file: {}", first_csv.display());
-                DataSource::Csv(CsvDataSource::new(first_csv))
+            } else {
+                // Directory: use DirectoryDataSource so all csv/fec/parquet/json files are processed and merged
+                use datasynth_fingerprint::extraction::DirectoryDataSource;
+                DataSource::Directory(DirectoryDataSource::new(input.clone()))
             };
 
             // Extract fingerprint

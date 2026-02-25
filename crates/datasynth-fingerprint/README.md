@@ -67,6 +67,18 @@ let extractor = FingerprintExtractor::with_config(config);
 let fingerprint = extractor.extract_from_csv("data.csv")?;
 ```
 
+### FEC (Fichier des Écritures Comptables)
+French standardized accounting export (18 columns, semicolon-separated, UTF-8). Use for French GAAP journal entry data.
+
+```rust
+use datasynth_fingerprint::extraction::{DataSource, FecDataSource, FingerprintExtractor};
+
+let source = DataSource::Fec(FecDataSource::new("export_compta.fec"));
+let fingerprint = extractor.extract(&source)?;
+```
+
+CLI: `datasynth-data fingerprint extract --input export.fec --output fp.dsf` or `--format fec` for non-.fec files.
+
 ### Parquet Files
 ```rust
 let source = DataSource::Parquet(ParquetDataSource::new("data.parquet"));

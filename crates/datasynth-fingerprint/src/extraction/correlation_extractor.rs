@@ -22,6 +22,7 @@ impl Extractor for CorrelationExtractor {
     ) -> FingerprintResult<ExtractedComponent> {
         let correlations = match data {
             DataSource::Csv(csv) => extract_from_csv(csv, config, privacy)?,
+            DataSource::Fec(fec) => extract_from_csv(&fec.as_csv(), config, privacy)?,
             DataSource::Parquet(_) | DataSource::Json(_) => {
                 // For Parquet and JSON, reuse the same logic via memory conversion
                 // For now, return empty correlations (can be extended later)

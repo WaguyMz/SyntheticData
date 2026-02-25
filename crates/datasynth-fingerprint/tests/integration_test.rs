@@ -9,7 +9,8 @@ use tempfile::TempDir;
 use datasynth_fingerprint::{
     evaluation::FidelityEvaluator,
     extraction::{
-        CsvDataSource, DataSource, DirectoryDataSource, ExtractionConfig, FingerprintExtractor,
+        CsvDataSource, DataSource, DirectoryDataSource, ExtractionConfig, FecDataSource,
+        FingerprintExtractor,
     },
     io::{validate_dsf, DsfSigner, DsfVerifier, FingerprintReader, FingerprintWriter, SigningKey},
     models::PrivacyLevel,
@@ -418,6 +419,43 @@ fn test_schema_extraction() {
     // Check for expected columns
     let column_names: Vec<_> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(column_names.iter().any(|c| *c == "id" || *c == "amount"));
+}
+
+/// Create minimal FEC (Fichier des Écritures Comptables) data — 18 columns, semicolon-separated.
+fn create_sample_fec(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    // FEC 18 mandatory columns (Article A47 A-1 LPF)
+    let header = "Code journal;Libellé journal;Numéro de l'écriture;Date de comptabilisation;Numéro de compte;Libellé de compte;Numéro de compte auxiliaire;Libellé de compte auxiliaire;Référence de la pièce justificative;Date d'émission de la pièce justificative;Libellé de l'écriture comptable;Montant au débit;Montant au crédit;Lettrage;Date de lettrage;Date de validation de l'écriture;Montant en devise;Identifiant de la devise";
+    let row1 = "VT;Ventes;1;20240115;411000;Clients;;;FAC-001;20240110;Facture client;1000.50;0.00;;;20240115;1000.50;EUR";
+    let row2 = "VT;Ventes;1;20240115;701000;Ventes;;;FAC-001;20240110;Facture client;0.00;1000.50;;;20240115;1000.50;EUR";
+    let content = format!("{}\n{}\n{}\n", header, row1, row2);
+    fs::write(&path, content).expect("Failed to write sample FEC");
+    path
+}
+
+#[test]
+fn test_extract_from_fec() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let fec_path = create_sample_fec(&temp_dir, "export.fec");
+
+    let data_source = DataSource::Fec(FecDataSource::new(fec_path));
+    let config = ExtractionConfig {
+        min_rows: 2,
+        ..Default::default()
+    };
+    let extractor = FingerprintExtractor::with_config(config);
+    let fingerprint = extractor
+        .extract(&data_source)
+        .expect("Failed to extract fingerprint from FEC");
+
+    assert_eq!(fingerprint.schema.tables.len(), 1);
+    let table = fingerprint.schema.tables.values().next().unwrap();
+    assert_eq!(table.columns.len(), 18, "FEC must have 18 columns");
+    // FEC columns present
+    let names: Vec<_> = table.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Montant au débit"));
+    assert!(names.contains(&"Montant au crédit"));
+    assert!(names.contains(&"Numéro de compte"));
 }
 
 /// Create sample JSON data for testing.

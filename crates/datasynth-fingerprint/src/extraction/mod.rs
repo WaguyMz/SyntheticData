@@ -205,6 +205,8 @@ pub trait Extractor: Send + Sync {
 pub enum DataSource {
     /// CSV file.
     Csv(CsvDataSource),
+    /// FEC (Fichier des Écritures Comptables) file — French accounting entries, semicolon-separated.
+    Fec(FecDataSource),
     /// Parquet file.
     Parquet(ParquetDataSource),
     /// JSON/JSONL file.
@@ -213,6 +215,43 @@ pub enum DataSource {
     Directory(DirectoryDataSource),
     /// In-memory data.
     Memory(MemoryDataSource),
+}
+
+/// FEC (Fichier des Écritures Comptables) data source.
+///
+/// French standardized accounting export format: 18 mandatory columns,
+/// semicolon-separated, UTF-8. Article A47 A-1 LPF.
+#[derive(Debug, Clone)]
+pub struct FecDataSource {
+    /// Path to the FEC file (typically .fec or .csv with FEC header).
+    pub path: std::path::PathBuf,
+}
+
+impl FecDataSource {
+    /// Create from a path.
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Return a CSV data source view (semicolon delimiter, with headers) for reuse of extraction logic.
+    pub fn as_csv(&self) -> CsvDataSource {
+        CsvDataSource {
+            path: self.path.clone(),
+            has_headers: true,
+            delimiter: b';',
+        }
+    }
+
+    /// Preferred table name for fingerprint (journal entries).
+    pub fn table_name(&self) -> String {
+        self.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("journal_entries")
+            .to_string()
+    }
 }
 
 /// CSV data source.
@@ -326,6 +365,7 @@ impl DirectoryDataSource {
             path: path.as_ref().to_path_buf(),
             extensions: vec![
                 "csv".to_string(),
+                "fec".to_string(),
                 "parquet".to_string(),
                 "json".to_string(),
                 "jsonl".to_string(),
@@ -768,6 +808,7 @@ impl FingerprintExtractor {
 
             let source = match ext.as_str() {
                 "csv" => DataSource::Csv(CsvDataSource::new(file_path)),
+                "fec" => DataSource::Fec(FecDataSource::new(file_path)),
                 "parquet" => DataSource::Parquet(ParquetDataSource::new(file_path)),
                 "json" => DataSource::Json(JsonDataSource::json_array(file_path)),
                 "jsonl" | "ndjson" => DataSource::Json(JsonDataSource::jsonl(file_path)),
@@ -850,6 +891,20 @@ fn build_source_metadata(source: &DataSource, schema: &SchemaFingerprint) -> Sou
                 .to_string();
             let rows = schema.tables.values().map(|t| t.row_count).sum();
             (format!("CSV file: {}", name), vec![name], rows)
+        }
+        DataSource::Fec(fec) => {
+            let name = fec
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let rows = schema.tables.values().map(|t| t.row_count).sum();
+            (
+                format!("FEC (Fichier des Écritures Comptables): {}", name),
+                vec![name],
+                rows,
+            )
         }
         DataSource::Parquet(pq) => {
             let name = pq
