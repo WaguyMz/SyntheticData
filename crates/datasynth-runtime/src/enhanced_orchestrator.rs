@@ -5241,10 +5241,19 @@ impl EnhancedOrchestrator {
             .map_err(|e| SynthError::config(format!("Invalid start_date: {}", e)))?;
 
         // Generate P2P chains
-        let p2p_count = self
-            .phase_config
-            .p2p_chains
-            .min(self.master_data.vendors.len() * 2);
+        // Default behavior capped chains at vendors.len() * 2. Relax this constraint when the
+        // user explicitly configures document flow chain counts (entry_share or p2p_chains in
+        // config): in that case, honor the configured counts even if they exceed vendors*2.
+        let configured_p2p = &self.config.document_flows;
+        let p2p_count = if configured_p2p.entry_share.is_some()
+            || configured_p2p.p2p_chains.is_some()
+        {
+            self.phase_config.p2p_chains
+        } else {
+            self.phase_config
+                .p2p_chains
+                .min(self.master_data.vendors.len() * 2)
+        };
         let pb = self.create_progress_bar(p2p_count as u64, "Generating P2P Document Flows");
 
         // Convert P2P config from schema to generator config
@@ -5307,11 +5316,17 @@ impl EnhancedOrchestrator {
             pb.finish_with_message("P2P document flows complete");
         }
 
-        // Generate O2C chains
-        let o2c_count = self
-            .phase_config
-            .o2c_chains
-            .min(self.master_data.customers.len() * 2);
+        // Generate O2C chains (same relaxation logic as P2P).
+        let configured_o2c = &self.config.document_flows;
+        let o2c_count = if configured_o2c.entry_share.is_some()
+            || configured_o2c.o2c_chains.is_some()
+        {
+            self.phase_config.o2c_chains
+        } else {
+            self.phase_config
+                .o2c_chains
+                .min(self.master_data.customers.len() * 2)
+        };
         let pb = self.create_progress_bar(o2c_count as u64, "Generating O2C Document Flows");
 
         // Convert O2C config from schema to generator config

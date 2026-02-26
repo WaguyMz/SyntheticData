@@ -44,7 +44,7 @@ if "$TEST"; then
 fi
 
 
-JOBS=$(($(nproc) - 2))
+JOBS=10
 if "$CHECK"; then
     cargo check -j$JOBS
 else
