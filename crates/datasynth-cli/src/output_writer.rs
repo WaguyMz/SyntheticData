@@ -129,17 +129,28 @@ fn csv_opt_str(opt: &Option<String>) -> String {
     }
 }
 
+/// Create directory or log warning and return false (so caller can skip section without aborting).
+fn create_dir_or_warn(path: &Path, name: &str) -> bool {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Failed to create {} directory: {}", name, e);
+            false
+        }
+    }
+}
+
 /// Write all generated data to the output directory.
 ///
 /// This function exports every non-empty dataset from the generation result.
 /// Journal entries are written as a flat CSV file (one row per line item)
 /// and as a nested JSON file. Other data is written as JSON files since
 /// many model types contain nested structures.
-pub fn write_all_output(
-    result: &EnhancedGenerationResult,
-    output_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(output_dir)?;
+pub fn write_all_output(result: &EnhancedGenerationResult, output_dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(output_dir) {
+        warn!("Failed to create output directory {}: {}", output_dir.display(), e);
+        return;
+    }
     info!("Writing comprehensive output to: {}", output_dir.display());
 
     // ========================================================================
@@ -152,11 +163,11 @@ pub fn write_all_output(
         }
 
         // Also write full journal entries as JSON for consumers that need the nested structure
-        write_json(
+        write_json_safe(
             &result.journal_entries,
             &output_dir.join("journal_entries.json"),
             "Journal entries (JSON)",
-        )?;
+        );
     }
 
     // ========================================================================
@@ -169,7 +180,9 @@ pub fn write_all_output(
         || !result.master_data.assets.is_empty()
         || !result.master_data.employees.is_empty()
     {
-        std::fs::create_dir_all(&md_dir)?;
+        if let Err(e) = std::fs::create_dir_all(&md_dir) {
+            warn!("Failed to create master_data directory: {}", e);
+        } else {
         info!("Writing master data...");
 
         write_json_safe(
@@ -197,16 +210,21 @@ pub fn write_all_output(
             &md_dir.join("employees.json"),
             "Employees",
         );
+        }
     }
 
     // ========================================================================
     // Document Flows
     // ========================================================================
     let df_dir = output_dir.join("document_flows");
-    if !result.document_flows.purchase_orders.is_empty()
+    let has_document_flows = !result.document_flows.purchase_orders.is_empty()
         || !result.document_flows.sales_orders.is_empty()
-    {
-        std::fs::create_dir_all(&df_dir)?;
+        || !result.document_flows.p2p_chains.is_empty()
+        || !result.document_flows.o2c_chains.is_empty();
+    if has_document_flows {
+        if let Err(e) = std::fs::create_dir_all(&df_dir) {
+            warn!("Failed to create document_flows directory: {}", e);
+        } else {
         info!("Writing document flows...");
 
         write_json_safe(
@@ -259,6 +277,7 @@ pub fn write_all_output(
                 result.document_flows.o2c_chains.len()
             );
         }
+        }
     }
 
     // ========================================================================
@@ -270,7 +289,9 @@ pub fn write_all_output(
         || !result.subledger.fa_records.is_empty()
         || !result.subledger.inventory_positions.is_empty()
     {
-        std::fs::create_dir_all(&sl_dir)?;
+        if let Err(e) = std::fs::create_dir_all(&sl_dir) {
+            warn!("Failed to create subledger directory: {}", e);
+        } else {
         info!("Writing subledger data...");
 
         write_json_safe(
@@ -298,14 +319,14 @@ pub fn write_all_output(
             &sl_dir.join("inventory_movements.json"),
             "Inventory movements",
         );
+        }
     }
 
     // ========================================================================
     // Audit
     // ========================================================================
     let audit_dir = output_dir.join("audit");
-    if !result.audit.engagements.is_empty() {
-        std::fs::create_dir_all(&audit_dir)?;
+    if !result.audit.engagements.is_empty() && create_dir_or_warn(&audit_dir, "audit") {
         info!("Writing audit data...");
 
         write_json_safe(
@@ -344,8 +365,7 @@ pub fn write_all_output(
     // Banking (JSON - keep existing format for backward compat)
     // ========================================================================
     let banking_dir = output_dir.join("banking");
-    if !result.banking.customers.is_empty() {
-        std::fs::create_dir_all(&banking_dir)?;
+    if !result.banking.customers.is_empty() && create_dir_or_warn(&banking_dir, "banking") {
         info!("Writing banking data...");
 
         write_json_safe(
@@ -394,8 +414,9 @@ pub fn write_all_output(
     // Sourcing (S2C)
     // ========================================================================
     let s2c_dir = output_dir.join("sourcing");
-    if !result.sourcing.spend_analyses.is_empty() || !result.sourcing.sourcing_projects.is_empty() {
-        std::fs::create_dir_all(&s2c_dir)?;
+    if (!result.sourcing.spend_analyses.is_empty() || !result.sourcing.sourcing_projects.is_empty())
+        && create_dir_or_warn(&s2c_dir, "sourcing")
+    {
         info!("Writing sourcing (S2C) data...");
 
         write_json_safe(
@@ -449,8 +470,7 @@ pub fn write_all_output(
     // Intercompany
     // ========================================================================
     let ic_dir = output_dir.join("intercompany");
-    if !result.intercompany.matched_pairs.is_empty() {
-        std::fs::create_dir_all(&ic_dir)?;
+    if !result.intercompany.matched_pairs.is_empty() && create_dir_or_warn(&ic_dir, "intercompany") {
         info!("Writing intercompany data...");
 
         write_json_safe(
@@ -479,10 +499,10 @@ pub fn write_all_output(
     // Financial Reporting
     // ========================================================================
     let fin_dir = output_dir.join("financial_reporting");
-    if !result.financial_reporting.financial_statements.is_empty()
-        || !result.financial_reporting.bank_reconciliations.is_empty()
+    if (!result.financial_reporting.financial_statements.is_empty()
+        || !result.financial_reporting.bank_reconciliations.is_empty())
+        && create_dir_or_warn(&fin_dir, "financial_reporting")
     {
-        std::fs::create_dir_all(&fin_dir)?;
         info!("Writing financial reporting data...");
 
         write_json_safe(
@@ -502,7 +522,7 @@ pub fn write_all_output(
     // ========================================================================
     if !result.financial_reporting.trial_balances.is_empty() {
         let pc_dir = output_dir.join("period_close");
-        std::fs::create_dir_all(&pc_dir)?;
+        if create_dir_or_warn(&pc_dir, "period_close") {
         info!(
             "Writing {} period-close trial balances...",
             result.financial_reporting.trial_balances.len()
@@ -512,6 +532,7 @@ pub fn write_all_output(
             &pc_dir.join("trial_balances.json"),
             "Period-close trial balances",
         );
+        }
     }
 
     // ========================================================================
@@ -519,7 +540,7 @@ pub fn write_all_output(
     // ========================================================================
     if !result.opening_balances.is_empty() || !result.subledger_reconciliation.is_empty() {
         let balance_dir = output_dir.join("balance");
-        std::fs::create_dir_all(&balance_dir)?;
+        if create_dir_or_warn(&balance_dir, "balance") {
         info!("Writing balance data...");
 
         write_json_safe(
@@ -532,17 +553,18 @@ pub fn write_all_output(
             &balance_dir.join("subledger_reconciliation.json"),
             "Subledger reconciliation",
         );
+        }
     }
 
     // ========================================================================
     // HR (Payroll, Time Entries, Expense Reports)
     // ========================================================================
     let hr_dir = output_dir.join("hr");
-    if !result.hr.payroll_runs.is_empty()
+    if (!result.hr.payroll_runs.is_empty()
         || !result.hr.time_entries.is_empty()
-        || !result.hr.expense_reports.is_empty()
+        || !result.hr.expense_reports.is_empty())
+        && create_dir_or_warn(&hr_dir, "hr")
     {
-        std::fs::create_dir_all(&hr_dir)?;
         info!("Writing HR data...");
 
         write_json_safe(
@@ -571,11 +593,11 @@ pub fn write_all_output(
     // Manufacturing
     // ========================================================================
     let mfg_dir = output_dir.join("manufacturing");
-    if !result.manufacturing.production_orders.is_empty()
+    if (!result.manufacturing.production_orders.is_empty()
         || !result.manufacturing.quality_inspections.is_empty()
-        || !result.manufacturing.cycle_counts.is_empty()
+        || !result.manufacturing.cycle_counts.is_empty())
+        && create_dir_or_warn(&mfg_dir, "manufacturing")
     {
-        std::fs::create_dir_all(&mfg_dir)?;
         info!("Writing manufacturing data...");
 
         write_json_safe(
@@ -599,11 +621,11 @@ pub fn write_all_output(
     // Sales, KPIs, Budgets
     // ========================================================================
     let sales_dir = output_dir.join("sales_kpi_budgets");
-    if !result.sales_kpi_budgets.sales_quotes.is_empty()
+    if (!result.sales_kpi_budgets.sales_quotes.is_empty()
         || !result.sales_kpi_budgets.kpis.is_empty()
-        || !result.sales_kpi_budgets.budgets.is_empty()
+        || !result.sales_kpi_budgets.budgets.is_empty())
+        && create_dir_or_warn(&sales_dir, "sales_kpi_budgets")
     {
-        std::fs::create_dir_all(&sales_dir)?;
         info!("Writing sales, KPI, and budget data...");
 
         write_json_safe(
@@ -627,11 +649,11 @@ pub fn write_all_output(
     // Tax
     // ========================================================================
     let tax_dir = output_dir.join("tax");
-    if !result.tax.jurisdictions.is_empty()
+    if (!result.tax.jurisdictions.is_empty()
         || !result.tax.codes.is_empty()
-        || !result.tax.tax_provisions.is_empty()
+        || !result.tax.tax_provisions.is_empty())
+        && create_dir_or_warn(&tax_dir, "tax")
     {
-        std::fs::create_dir_all(&tax_dir)?;
         info!("Writing tax data...");
 
         write_json_safe(
@@ -677,12 +699,12 @@ pub fn write_all_output(
     // ESG
     // ========================================================================
     let esg_dir = output_dir.join("esg");
-    if !result.esg.emissions.is_empty()
+    if (!result.esg.emissions.is_empty()
         || !result.esg.energy.is_empty()
         || !result.esg.diversity.is_empty()
-        || !result.esg.governance.is_empty()
+        || !result.esg.governance.is_empty())
+        && create_dir_or_warn(&esg_dir, "esg")
     {
-        std::fs::create_dir_all(&esg_dir)?;
         info!("Writing ESG data...");
 
         write_json_safe(
@@ -763,7 +785,7 @@ pub fn write_all_output(
     if let Some(ref event_log) = result.ocpm.event_log {
         if !event_log.events.is_empty() || !event_log.objects.is_empty() {
             let pm_dir = output_dir.join("process_mining");
-            std::fs::create_dir_all(&pm_dir)?;
+            if create_dir_or_warn(&pm_dir, "process_mining") {
             info!("Writing process mining (OCPM) data...");
 
             // Write the full OCEL 2.0 event log
@@ -827,6 +849,7 @@ pub fn write_all_output(
                     Err(e) => warn!("Failed to serialize process variants: {}", e),
                 }
             }
+            }
         }
     }
 
@@ -883,7 +906,7 @@ pub fn write_all_output(
     // ========================================================================
     if !result.internal_controls.is_empty() {
         let ctrl_dir = output_dir.join("internal_controls");
-        std::fs::create_dir_all(&ctrl_dir)?;
+        if create_dir_or_warn(&ctrl_dir, "internal_controls") {
         info!("Writing internal controls data...");
 
         write_json_safe(
@@ -891,6 +914,7 @@ pub fn write_all_output(
             &ctrl_dir.join("internal_controls.json"),
             "Internal controls",
         );
+        }
     }
 
     // ========================================================================
@@ -900,7 +924,7 @@ pub fn write_all_output(
         || !result.accounting_standards.impairment_tests.is_empty()
     {
         let acct_dir = output_dir.join("accounting_standards");
-        std::fs::create_dir_all(&acct_dir)?;
+        if create_dir_or_warn(&acct_dir, "accounting_standards") {
         info!("Writing accounting standards data...");
 
         write_json_safe(
@@ -913,6 +937,7 @@ pub fn write_all_output(
             &acct_dir.join("impairment_tests.json"),
             "Impairment tests",
         );
+        }
     }
 
     // ========================================================================
@@ -942,7 +967,7 @@ pub fn write_all_output(
         || !result.treasury.hedging_instruments.is_empty()
     {
         let treasury_dir = output_dir.join("treasury");
-        std::fs::create_dir_all(&treasury_dir)?;
+        if create_dir_or_warn(&treasury_dir, "treasury") {
         info!("Writing treasury data...");
 
         write_json_safe(
@@ -987,6 +1012,7 @@ pub fn write_all_output(
                 "Treasury anomaly labels",
             );
         }
+        }
     }
 
     // ========================================================================
@@ -994,7 +1020,7 @@ pub fn write_all_output(
     // ========================================================================
     if !result.project_accounting.projects.is_empty() {
         let pa_dir = output_dir.join("project_accounting");
-        std::fs::create_dir_all(&pa_dir)?;
+        if create_dir_or_warn(&pa_dir, "project_accounting") {
         info!("Writing project accounting data...");
 
         write_json_safe(
@@ -1027,6 +1053,7 @@ pub fn write_all_output(
             &pa_dir.join("milestones.json"),
             "Project milestones",
         );
+        }
     }
 
     // ========================================================================
@@ -1062,7 +1089,6 @@ pub fn write_all_output(
     }
 
     info!("Output writing complete.");
-    Ok(())
 }
 
 /// Write JSON with error handling - logs a warning on failure but does not abort.

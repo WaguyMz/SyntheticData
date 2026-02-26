@@ -102,6 +102,8 @@ pub use composition::{
 pub use differential::*;
 pub use kanonymity::*;
 
+use tracing::info;
+
 use crate::error::{FingerprintError, FingerprintResult};
 use crate::models::{
     PrivacyAction, PrivacyActionType, PrivacyAudit, PrivacyLevel, PrivacyMetadata,
@@ -245,18 +247,26 @@ impl PrivacyEngine {
 
     /// Add noise to a numeric value.
     ///
-    /// Each call consumes `epsilon / 100.0` of the privacy budget.
-    /// The mechanism is recorded with both the audit trail (for logging)
-    /// and the accountant (for composition-aware budget tracking).
+    /// Each call consumes `epsilon / MAX_NOISE_QUERIES` of the privacy budget, so that
+    /// up to MAX_NOISE_QUERIES calls stay within total ε. Set high enough to cover column
+    /// stats plus per-account-class stats for large charts (e.g. 10 cols × 2 + 100 classes × 4 ≈ 420).
     pub fn add_noise(
         &mut self,
         value: f64,
         sensitivity: f64,
         target: &str,
     ) -> FingerprintResult<f64> {
-        let epsilon_per_query = self.config.epsilon / 100.0; // Budget across many queries
+        /// Max add_noise calls per fingerprint so column stats + per-account-class fit (ε-DP).
+        const MAX_NOISE_QUERIES: f64 = 1000.0;
+        let epsilon_per_query = self.config.epsilon / MAX_NOISE_QUERIES;
 
         if !self.can_spend(epsilon_per_query) {
+            info!(
+                spent = %self.audit.total_epsilon_spent,
+                limit = %self.config.epsilon,
+                target = %target,
+                "privacy budget exhausted. To fill amount_by_account_class, re-run with a larger budget, e.g. --privacy-epsilon 2.0"
+            );
             return Err(FingerprintError::PrivacyBudgetExhausted {
                 spent: self.audit.total_epsilon_spent,
                 limit: self.config.epsilon,
@@ -462,18 +472,18 @@ mod tests {
         assert_eq!(engine.composition_method(), CompositionMethod::Naive);
         assert!((engine.remaining_budget() - 1.0).abs() < 1e-10);
 
-        // Add noise 50 times (each costing epsilon/100 = 0.01)
+        // Add noise 50 times (each costing epsilon/MAX_NOISE_QUERIES = 1/1000 = 0.001)
         for i in 0..50 {
             engine.add_noise(100.0, 1.0, &format!("col_{}", i)).unwrap();
         }
 
-        // With naive composition, total spent = 50 * 0.01 = 0.50
+        // With naive composition, total spent = 50 * 0.001 = 0.05
         let audit = engine.audit();
-        assert!((audit.total_epsilon_spent - 0.50).abs() < 1e-10);
+        assert!((audit.total_epsilon_spent - 0.05).abs() < 1e-10);
         assert_eq!(audit.actions.len(), 50);
 
         // can_spend should use audit-based remaining budget
-        let remaining = 1.0 - 0.50;
+        let remaining = 1.0 - 0.05;
         assert!((engine.remaining_budget() - remaining).abs() < 1e-10);
     }
 
@@ -599,23 +609,23 @@ mod tests {
 
     #[test]
     fn test_naive_budget_exhaustion() {
-        // With Naive composition and epsilon=1.0, each query costs epsilon/100 = 0.01.
-        // Due to floating-point accumulation, we may not get exactly 100 queries.
+        // With Naive composition and epsilon=1.0, each query costs epsilon/MAX_NOISE_QUERIES (1000).
+        // Due to floating-point accumulation, we may not get exactly 1000 queries.
         // The key property: the engine MUST eventually refuse queries.
         let mut engine = PrivacyEngine::from_level(PrivacyLevel::Standard);
 
         let mut succeeded = 0;
-        for i in 0..110 {
+        for i in 0..1020 {
             match engine.add_noise(1.0, 1.0, &format!("q_{}", i)) {
                 Ok(_) => succeeded += 1,
                 Err(_) => break,
             }
         }
 
-        // Should get close to 100 queries (floating-point may cause slight variance)
+        // Should get close to 1000 queries (floating-point may cause slight variance)
         assert!(
-            (99..=100).contains(&succeeded),
-            "Expected ~100 successful queries, got {}",
+            (999..=1000).contains(&succeeded),
+            "Expected ~1000 successful queries, got {}",
             succeeded
         );
 
@@ -632,15 +642,14 @@ mod tests {
         // RDP with composition should allow more queries before the
         // effective epsilon reaches the budget, compared to naive.
         //
-        // With epsilon=1.0 and naive: exactly 100 queries at 0.01 each.
+        // With epsilon=1.0 and naive: 1000 queries at 0.001 each.
         // With RDP: effective_epsilon grows sub-linearly, so more queries fit.
         let mut rdp_config = PrivacyConfig::custom(1.0, 5);
         rdp_config.composition_method = CompositionMethod::RenyiDP;
         let mut rdp_engine = PrivacyEngine::new(rdp_config);
 
         let mut count = 0;
-        for i in 0..500 {
-            // Try up to 500, should get more than 100
+        for i in 0..1500 {
             let result = rdp_engine.add_noise(1.0, 1.0, &format!("q_{}", i));
             if result.is_err() {
                 break;
@@ -649,8 +658,8 @@ mod tests {
         }
 
         assert!(
-            count > 100,
-            "RDP engine should allow more than 100 queries (got {}), since \
+            count > 1000,
+            "RDP engine should allow more than 1000 queries (got {}), since \
              effective epsilon grows sub-linearly with composition",
             count
         );
@@ -713,8 +722,8 @@ mod tests {
         let audit_remaining = engine.remaining_budget();
         let accountant_remaining = engine.accountant_remaining_budget();
 
-        // Audit remaining = total - sum(per_query_eps) = 5.0 - 50*0.05 = 2.5
-        assert!((audit_remaining - 2.5).abs() < 1e-10);
+        // Audit remaining = total - sum(per_query_eps) = 5.0 - 50*(5/1000) = 5.0 - 0.25 = 4.75
+        assert!((audit_remaining - 4.75).abs() < 1e-10);
 
         // Accountant remaining should be larger (because effective eps < sum)
         assert!(

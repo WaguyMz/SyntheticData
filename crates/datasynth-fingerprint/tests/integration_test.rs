@@ -9,11 +9,11 @@ use tempfile::TempDir;
 use datasynth_fingerprint::{
     evaluation::FidelityEvaluator,
     extraction::{
-        CsvDataSource, DataSource, DirectoryDataSource, ExtractionConfig, FecDataSource,
-        FingerprintExtractor,
+        AccountingStandards, CsvDataSource, DataSource, DirectoryDataSource, ExtractionConfig,
+        FecDataSource, FingerprintExtractor, FEC_NUMERIC_COLUMNS,
     },
     io::{validate_dsf, DsfSigner, DsfVerifier, FingerprintReader, FingerprintWriter, SigningKey},
-    models::PrivacyLevel,
+    models::{DataType, PrivacyLevel},
     privacy::PrivacyConfig,
     synthesis::ConfigSynthesizer,
 };
@@ -128,6 +128,7 @@ fn test_extract_with_privacy_levels() {
 
         // Higher privacy levels should have more epsilon budget
         match level {
+            PrivacyLevel::Tiny => assert!(fingerprint.manifest.privacy.epsilon >= 19.0),
             PrivacyLevel::Minimal => assert!(fingerprint.manifest.privacy.epsilon >= 4.0),
             PrivacyLevel::Standard => assert!(fingerprint.manifest.privacy.epsilon >= 0.9),
             PrivacyLevel::High => assert!(fingerprint.manifest.privacy.epsilon >= 0.4),
@@ -451,11 +452,254 @@ fn test_extract_from_fec() {
     assert_eq!(fingerprint.schema.tables.len(), 1);
     let table = fingerprint.schema.tables.values().next().unwrap();
     assert_eq!(table.columns.len(), 18, "FEC must have 18 columns");
-    // FEC columns present
     let names: Vec<_> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"Montant au débit"));
     assert!(names.contains(&"Montant au crédit"));
     assert!(names.contains(&"Numéro de compte"));
+    // Only amount columns are numeric (Decimal); all others categorical (String)
+    for col in &table.columns {
+        if FEC_NUMERIC_COLUMNS.contains(&col.name.as_str()) {
+            assert_eq!(col.data_type, DataType::Decimal, "FEC amount column should be Decimal");
+        } else {
+            assert_eq!(col.data_type, DataType::String, "FEC non-amount column should be String");
+        }
+    }
+    // Statistics: only numeric columns get numeric stats
+    let numeric_keys: Vec<_> = fingerprint.statistics.numeric_columns.keys().collect();
+    for key in &numeric_keys {
+        let col = key.split('.').last().unwrap_or("");
+        assert!(FEC_NUMERIC_COLUMNS.contains(&col), "only amount columns should have numeric stats");
+    }
+}
+
+/// Create FEC with enough rows per account class to trigger amount_by_account_class (>= 5 per class).
+fn create_fec_with_account_classes(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    let header = "Code journal;Libellé journal;Numéro de l'écriture;Date de comptabilisation;Numéro de compte;Libellé de compte;Numéro de compte auxiliaire;Libellé de compte auxiliaire;Référence de la pièce justificative;Date d'émission de la pièce justificative;Libellé de l'écriture comptable;Montant au débit;Montant au crédit;Lettrage;Date de lettrage;Date de validation de l'écriture;Montant en devise;Identifiant de la devise";
+    let mut rows = Vec::new();
+    // Class 411 (receivables): 6 debit lines
+    for i in 0..6 {
+        rows.push(format!(
+            "VT;Ventes;{};20240115;411000;Clients;;;FAC-{:03};20240110;Facture;{};0.00;;;20240115;{};EUR",
+            i + 1, i, 500.0 + (i as f64) * 100.0, 500.0 + (i as f64) * 100.0
+        ));
+    }
+    // Class 601 (purchases): 6 credit lines
+    for i in 0..6 {
+        rows.push(format!(
+            "AC;Achats;{};20240116;601000;Achats;;;PO-{:03};20240112;Achat;0.00;{};;;20240116;{};EUR",
+            i + 7, i, 200.0 + (i as f64) * 50.0, 200.0 + (i as f64) * 50.0
+        ));
+    }
+    let content = format!("{}\n{}\n", header, rows.join("\n"));
+    fs::write(&path, content).expect("Failed to write FEC");
+    path
+}
+
+#[test]
+fn test_fec_amount_by_account_class() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let fec_path = create_fec_with_account_classes(&temp_dir, "export_classes.fec");
+
+    let data_source = DataSource::Fec(FecDataSource::new(fec_path));
+    let config = ExtractionConfig {
+        min_rows: 2,
+        ..Default::default()
+    };
+    let extractor = FingerprintExtractor::with_config(config);
+    let fingerprint = extractor
+        .extract(&data_source)
+        .expect("Failed to extract fingerprint from FEC");
+
+    let by_class = fingerprint
+        .statistics
+        .amount_by_account_class
+        .as_ref()
+        .expect("FEC with enough rows per class should have amount_by_account_class");
+    assert!(by_class.contains_key("411"), "class 411 (receivables) should be present");
+    assert!(by_class.contains_key("601"), "class 601 (purchases) should be present");
+    let s411 = &by_class["411"];
+    assert_eq!(s411.account_class, "411");
+    assert_eq!(s411.row_count, 6);
+    assert_eq!(s411.debit_stats.count, 6);
+    let s601 = &by_class["601"];
+    assert_eq!(s601.row_count, 6);
+    assert_eq!(s601.credit_stats.count, 6);
+}
+
+/// CSV with CompteNum, Debit, Credit (e.g. French GL-style) should get amount_by_account_class (per 3 digits).
+#[test]
+fn test_csv_comptenum_debit_credit_amount_by_account_class() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("gl_export.csv");
+    // Headers: CompteNum, Debit, Credit
+    let mut wtr = csv::Writer::from_path(&path).expect("create csv");
+    wtr.write_record(&["CompteNum", "Debit", "Credit"]).expect("header");
+    for i in 0..10 {
+        let account = if i < 5 { "280510" } else { "601200" }; // first 3 digits: 280, 601
+        let (d, c) = if i % 2 == 0 { (100.0 + i as f64 * 10.0, 0.0) } else { (0.0, 100.0 + i as f64 * 10.0) };
+        let d_str = format!("{}", d);
+        let c_str = format!("{}", c);
+        wtr.write_record(&[account, &d_str, &c_str]).expect("row");
+    }
+    wtr.flush().expect("flush");
+    drop(wtr);
+
+    let data_source = DataSource::Csv(CsvDataSource::new(&path));
+    let config = ExtractionConfig {
+        min_rows: 2,
+        ..Default::default()
+    };
+    let extractor = FingerprintExtractor::with_config(config);
+    let fingerprint = extractor
+        .extract(&data_source)
+        .expect("Failed to extract from CSV");
+    let by_class = fingerprint
+        .statistics
+        .amount_by_account_class
+        .as_ref()
+        .expect("CSV with CompteNum, Debit, Credit should have amount_by_account_class");
+    assert!(by_class.contains_key("280"), "class 280 should be present");
+    assert!(by_class.contains_key("601"), "class 601 should be present");
+
+    // Strong assertion: Debit and Credit must be in numeric_columns (never categorical)
+    let table_name = "gl_export";
+    let debit_key = format!("{}.Debit", table_name);
+    let credit_key = format!("{}.Credit", table_name);
+    assert!(
+        fingerprint.statistics.numeric_columns.contains_key(&debit_key),
+        "Debit must be extracted as numeric_columns key '{}', got keys: {:?}",
+        debit_key,
+        fingerprint.statistics.numeric_columns.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        fingerprint.statistics.numeric_columns.contains_key(&credit_key),
+        "Credit must be extracted as numeric_columns key '{}'",
+        credit_key
+    );
+}
+
+/// Strong assertion: with french_gaap, Debit and Credit (including European format) must be in numeric_columns.
+#[test]
+fn test_debit_credit_must_be_numeric_columns() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("french_gl.csv");
+    let mut wtr = csv::Writer::from_path(&path).expect("create csv");
+    wtr.write_record(&["CompteNum", "Debit", "Credit"]).expect("header");
+    for i in 0..20 {
+        let account = if i < 10 { "411000" } else { "601200" };
+        let (d, c) = if i % 2 == 0 {
+            ("0,00", "100,50")
+        } else {
+            ("50,25", "0,00")
+        };
+        wtr.write_record(&[account, d, c]).expect("row");
+    }
+    wtr.flush().expect("flush");
+    drop(wtr);
+
+    let data_source = DataSource::Csv(CsvDataSource::new(&path));
+    let config = ExtractionConfig {
+        min_rows: 2,
+        accounting_standards: AccountingStandards::FrenchGaap,
+        ..Default::default()
+    };
+    let extractor = FingerprintExtractor::with_config(config);
+    let fingerprint = extractor
+        .extract(&data_source)
+        .expect("Extract must succeed with European-format Debit/Credit");
+
+    let table_name = "french_gl";
+    assert!(
+        fingerprint.statistics.numeric_columns.contains_key(&format!("{}.Debit", table_name)),
+        "Debit must be in numeric_columns (European format 0,00 / 50,25)"
+    );
+    assert!(
+        fingerprint.statistics.numeric_columns.contains_key(&format!("{}.Credit", table_name)),
+        "Credit must be in numeric_columns (European format 100,50 / 0,00)"
+    );
+}
+
+/// FEC-style CSV with exact header layout (leading comma, CompteNum, Debit, Credit) must yield amount_by_account_class.
+#[test]
+fn test_fec_style_csv_amount_by_account_class() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("fec_style.csv");
+    // FEC-style column order: leading empty, then JournalCode, ..., CompteNum, ..., Debit, Credit, ...
+    let mut wtr = csv::Writer::from_path(&path).expect("create csv");
+    wtr.write_record(&[
+        "",
+        "JournalCode",
+        "JournalLib",
+        "EcritureNum",
+        "EcritureDate",
+        "CompteNum",
+        "CompteLib",
+        "CompAuxNum",
+        "CompAuxLib",
+        "PieceRef",
+        "PieceDate",
+        "EcritureLib",
+        "Debit",
+        "Credit",
+        "EcritureLet",
+        "DateLet",
+        "ValidDate",
+        "Montantdevise",
+        "Idevise",
+    ])
+    .expect("header");
+    for i in 0..30 {
+        let account = if i < 15 { "411000" } else { "601200" };
+        let (d, c) = if i % 2 == 0 { ("0,00", "100,50") } else { ("50,25", "0,00") };
+        wtr.write_record(&[
+            "",
+            "G",
+            "Comptabilité",
+            "1",
+            "20230101",
+            account,
+            "Lib",
+            "",
+            "",
+            "REF",
+            "20230101",
+            "Lib",
+            d,
+            c,
+            "",
+            "",
+            "20230101",
+            "",
+            "",
+        ])
+        .expect("row");
+    }
+    wtr.flush().expect("flush");
+    drop(wtr);
+
+    let data_source = DataSource::Csv(CsvDataSource::new(&path));
+    let config = ExtractionConfig {
+        min_rows: 2,
+        accounting_standards: AccountingStandards::FrenchGaap,
+        ..Default::default()
+    };
+    let extractor = FingerprintExtractor::with_config(config);
+    let fingerprint = extractor
+        .extract(&data_source)
+        .expect("FEC-style CSV must extract successfully");
+
+    let by_class = fingerprint
+        .statistics
+        .amount_by_account_class
+        .as_ref()
+        .expect("FEC-style CSV must have amount_by_account_class (truncate account first, then aggregate)");
+    assert!(
+        !by_class.is_empty(),
+        "amount_by_account_class must be non-empty"
+    );
+    assert!(by_class.contains_key("411"), "subclass 411 (first 3 digits) must be present");
+    assert!(by_class.contains_key("601"), "subclass 601 must be present");
 }
 
 /// Create sample JSON data for testing.

@@ -16,7 +16,10 @@ use datasynth_core::memory_guard::{MemoryGuard, MemoryGuardConfig};
 use datasynth_core::models::{CoAComplexity, IndustrySector};
 use datasynth_fingerprint::{
     evaluation::FidelityEvaluator,
-    extraction::{CsvDataSource, DataSource, ExtractionConfig, FecDataSource, FingerprintExtractor},
+    extraction::{
+        AccountingStandards, CsvDataSource, DataSource, ExtractionConfig, FecDataSource,
+        FingerprintExtractor,
+    },
     io::{validate_dsf, FingerprintReader, FingerprintWriter},
     models::PrivacyLevel,
     privacy::PrivacyConfig,
@@ -190,6 +193,10 @@ enum FingerprintCommands {
         /// Sign the fingerprint
         #[arg(long)]
         sign: bool,
+
+        /// Accounting standards for column/delimiter interpretation: us_gaap (default) or french_gaap (FEC-style, semicolon, amount columns only, dates temporal)
+        #[arg(long, default_value = "us_gaap")]
+        accounting_standards: String,
     },
 
     /// Validate a fingerprint file
@@ -244,8 +251,12 @@ enum FingerprintCommands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Setup logging
-    let filter = if cli.verbose { "debug" } else { "info" };
+    // Setup logging: include datasynth_fingerprint so per-account-class and privacy budget logs are visible
+    let filter = if cli.verbose {
+        "debug,datasynth_fingerprint=debug"
+    } else {
+        "info,datasynth_fingerprint=info"
+    };
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(
@@ -355,8 +366,8 @@ fn main() -> Result<()> {
                 let mut cfg: GeneratorConfig = serde_yaml::from_str(&content)?;
                 apply_safety_limits(&mut cfg);
                 ConfigOrOrchestrator::Config(cfg)
-            } else if let Some(config_path) = config {
-                let content = std::fs::read_to_string(&config_path)?;
+            } else if let Some(ref config_path) = config {
+                let content = std::fs::read_to_string(config_path)?;
                 let mut cfg: GeneratorConfig = serde_yaml::from_str(&content)?;
                 // Apply safety limits to loaded config
                 apply_safety_limits(&mut cfg);
@@ -418,13 +429,24 @@ fn main() -> Result<()> {
                 }
             };
 
-            // Extract generator_config for logging and manifest
+            // Extract generator_config for logging, manifest, and output decisions (e.g. FEC)
+            // When using fingerprint: use --config if provided (e.g. French GAAP for FEC), else
+            // assume FEC output (fingerprint often from FEC) so FEC is written.
             let generator_config = match &config_or_orchestrator {
                 ConfigOrOrchestrator::Config(cfg) => cfg.clone(),
                 ConfigOrOrchestrator::Orchestrator(_) => {
-                    // Placeholder for logging - fingerprint orchestrator has its own config
-                    // Use demo preset as a stand-in for manifest generation
-                    create_safe_demo_preset()
+                    if let Some(config_path) = &config {
+                        let content = std::fs::read_to_string(config_path)?;
+                        let mut cfg: GeneratorConfig = serde_yaml::from_str(&content)?;
+                        apply_safety_limits(&mut cfg);
+                        cfg
+                    } else {
+                        let mut cfg = create_safe_demo_preset();
+                        // Fingerprint-based generation often uses FEC source; enable FEC output
+                        cfg.accounting_standards.framework =
+                            Some(AccountingFrameworkConfig::FrenchGaap);
+                        cfg
+                    }
                 }
             };
 
@@ -586,11 +608,17 @@ fn main() -> Result<()> {
 
             // Write all generated data (journal entries, master data, document flows,
             // subledgers, HR, manufacturing, sourcing, banking, audit, tax, ESG, etc.)
-            if let Err(e) = output_writer::write_all_output(&result, &output) {
-                tracing::warn!("Some output files may not have been written: {}", e);
-            }
+            tracing::info!(
+                "Writing all output to {} (entries: {}, document_flows: {} P2P + {} O2C)",
+                output.display(),
+                result.journal_entries.len(),
+                result.document_flows.p2p_chains.len(),
+                result.document_flows.o2c_chains.len()
+            );
+            output_writer::write_all_output(&result, &output);
+            tracing::info!("Output write phase complete");
 
-            // Write FEC (Fichier des Écritures Comptables) when French GAAP – 18 mandatory columns
+            // Write FEC (Fichier des Écritures Comptables) only when French GAAP – 18 mandatory columns
             if matches!(
                 config_for_manifest.accounting_standards.framework,
                 Some(AccountingFrameworkConfig::FrenchGaap)
@@ -701,10 +729,6 @@ fn main() -> Result<()> {
                 (
                     "master_data/materials.json",
                     result.master_data.materials.len(),
-                ),
-                (
-                    "master_data/fixed_assets.json",
-                    result.master_data.assets.len(),
                 ),
                 (
                     "master_data/employees.json",
@@ -1218,6 +1242,7 @@ fn main() -> Result<()> {
         } => {
             let industry_sector = match industry.to_lowercase().as_str() {
                 "manufacturing" => IndustrySector::Manufacturing,
+                "transportation" => IndustrySector::Transportation,
                 "retail" => IndustrySector::Retail,
                 "financial" | "financial_services" => IndustrySector::FinancialServices,
                 "healthcare" => IndustrySector::Healthcare,
@@ -1411,6 +1436,53 @@ fn main() -> Result<()> {
     }
 }
 
+/// Returns true if headers look like GL columns (account + debit + credit) for fingerprint amount_by_account_class.
+fn headers_have_gl_columns(first_line: &str, delimiter: u8) -> bool {
+    let parts: Vec<&str> = if delimiter == b';' {
+        first_line.split(';').map(|s| s.trim().trim_start_matches('\u{feff}')).collect()
+    } else {
+        first_line.split(',').map(|s| s.trim().trim_start_matches('\u{feff}')).collect()
+    };
+    let lower: Vec<String> = parts.iter().map(|s| s.to_lowercase()).collect();
+    let has_debit = lower.iter().any(|h| h.contains("debit") || h.contains("débit"));
+    let has_credit = lower.iter().any(|h| h.contains("credit") || h.contains("crédit"));
+    let has_account = lower.iter().any(|h| {
+        h == "comptenum" || h == "compte num" || h == "compte_num"
+            || (h.contains("compte") && !h.contains("lib"))
+    });
+    has_debit && has_credit && has_account
+}
+
+/// Infer CSV delimiter from the first line.
+/// Prefers the delimiter that yields recognizable GL headers (CompteNum, Debit, Credit) so APRR-style comma-delimited files work.
+/// Otherwise: if splitting by `;` yields more fields than `,`, use semicolon (FEC); else comma.
+fn infer_csv_delimiter(path: &std::path::Path) -> Result<u8> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(f);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(b',');
+    }
+    let line = line.trim();
+    if headers_have_gl_columns(line, b',') && !headers_have_gl_columns(line, b';') {
+        return Ok(b',');
+    }
+    if headers_have_gl_columns(line, b';') && !headers_have_gl_columns(line, b',') {
+        return Ok(b';');
+    }
+    if headers_have_gl_columns(line, b',') {
+        return Ok(b',');
+    }
+    let n_comma = line.split(',').count();
+    let n_semicolon = line.split(';').count();
+    if n_semicolon > n_comma {
+        Ok(b';')
+    } else {
+        Ok(b',')
+    }
+}
+
 /// Handle fingerprint subcommands.
 fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
     match command {
@@ -1422,11 +1494,13 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
             privacy_epsilon,
             privacy_k,
             sign,
+            accounting_standards,
         } => {
             tracing::info!("Extracting fingerprint from: {}", input.display());
 
             // Parse privacy level
             let level = match privacy_level.to_lowercase().as_str() {
+                "tiny" => PrivacyLevel::Tiny,
                 "minimal" => PrivacyLevel::Minimal,
                 "standard" => PrivacyLevel::Standard,
                 "high" => PrivacyLevel::High,
@@ -1446,8 +1520,17 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
                 privacy_config.k_anonymity = k;
             }
 
+            let accounting_standards = match accounting_standards.to_lowercase().as_str() {
+                "french_gaap" | "french" | "fec" => AccountingStandards::FrenchGaap,
+                _ => AccountingStandards::UsGaap,
+            };
+            if accounting_standards == AccountingStandards::FrenchGaap {
+                tracing::info!("Accounting standards: french_gaap (FEC-style; semicolon delimiter, amount columns only, dates temporal)");
+            }
+
             let extraction_config = ExtractionConfig {
                 privacy: privacy_config,
+                accounting_standards,
                 ..Default::default()
             };
 
@@ -1471,7 +1554,20 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
                     tracing::info!("Using FEC (Fichier des Écritures Comptables) as input");
                     DataSource::Fec(FecDataSource::new(input.clone()))
                 } else {
-                    DataSource::Csv(CsvDataSource::new(input.clone()))
+                    // Delimiter: auto-infer from first line (semicolon if more fields with ; than ,)
+                    let csv_delimiter = if input.extension().map_or(false, |e| e.eq_ignore_ascii_case("csv")) {
+                        infer_csv_delimiter(&input).unwrap_or(b',')
+                    } else {
+                        b','
+                    };
+                    if csv_delimiter == b';' {
+                        tracing::info!("CSV delimiter auto-inferred as semicolon (FEC-style)");
+                    }
+                    DataSource::Csv(CsvDataSource {
+                        path: input.clone().into(),
+                        has_headers: true,
+                        delimiter: csv_delimiter,
+                    })
                 }
             } else {
                 // Directory: use DirectoryDataSource so all csv/fec/parquet/json files are processed and merged
@@ -1489,6 +1585,13 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
                 tracing::info!("Signing is not yet implemented, writing unsigned fingerprint");
             }
             writer.write_to_file(&fingerprint, &output)?;
+
+            // Also write human-readable JSON with same fingerprint content (same stem, .json)
+            let json_path = output.with_extension("json");
+            let json_str = serde_json::to_string_pretty(&fingerprint)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize fingerprint to JSON: {}", e))?;
+            std::fs::write(&json_path, json_str)?;
+            tracing::info!("Fingerprint (human-readable JSON) written to: {}", json_path.display());
 
             tracing::info!("Fingerprint written to: {}", output.display());
             tracing::info!(
@@ -1899,7 +2002,8 @@ fn create_safe_demo_preset() -> GeneratorConfig {
         transactions: TransactionConfig::default(),
         output: OutputConfig::default(),
         fraud: FraudConfig {
-            enabled: false,
+            enabled: true,
+            fraud_rate: 0.01,
             ..Default::default()
         },
         internal_controls: InternalControlsConfig::default(),
@@ -1938,7 +2042,17 @@ fn create_safe_demo_preset() -> GeneratorConfig {
         behavioral_drift: datasynth_config::schema::BehavioralDriftSchemaConfig::default(),
         market_drift: datasynth_config::schema::MarketDriftSchemaConfig::default(),
         drift_labeling: datasynth_config::schema::DriftLabelingSchemaConfig::default(),
-        anomaly_injection: Default::default(),
+        anomaly_injection: {
+            let mut c = EnhancedAnomalyConfig::default();
+            c.enabled = true;
+            c.rates = AnomalyRateConfig {
+                total_rate: 0.02,
+                fraud_rate: 0.008,
+                error_rate: 0.01,
+                process_rate: 0.002,
+            };
+            c
+        },
         industry_specific: Default::default(),
         fingerprint_privacy: Default::default(),
         quality_gates: Default::default(),

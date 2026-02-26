@@ -79,6 +79,8 @@ let fingerprint = extractor.extract(&source)?;
 
 CLI: `datasynth-data fingerprint extract --input export.fec --output fp.dsf` or `--format fec` for non-.fec files.
 
+**Per-account-class amount distributions (level 3):** For FEC, the fingerprint also computes amount statistics **per account class** using the first 3 digits of "Numéro de compte" (e.g. 411, 601). Each class with at least 5 lines gets `debit_stats` and `credit_stats` (mean, std_dev, percentiles, Benford). This is stored in `statistics.amount_by_account_class`. During synthesis, a row-count-weighted mixture is used for the global amount config, and the full per-class params are written into the config patch. At generation time, the runtime applies this patch and the JE generator uses **per-line sampling by account class**: line amounts are sampled from the class’s debit/credit distribution (first 3 digits of the GL account), so synthetic data mimics those marginal distributions.
+
 ### Parquet Files
 ```rust
 let source = DataSource::Parquet(ParquetDataSource::new("data.parquet"));

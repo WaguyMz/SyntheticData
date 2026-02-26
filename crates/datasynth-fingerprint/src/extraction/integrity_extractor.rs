@@ -41,30 +41,18 @@ impl Extractor for IntegrityExtractor {
     }
 }
 
-/// Extract integrity from CSV.
+/// Extract integrity from CSV (via Polars).
 fn extract_from_csv(
     csv: &super::CsvDataSource,
     _config: &ExtractionConfig,
     _privacy: &mut PrivacyEngine,
 ) -> FingerprintResult<IntegrityFingerprint> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(csv.has_headers)
-        .delimiter(csv.delimiter)
-        .from_path(&csv.path)?;
-
-    let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
-
-    // Collect all values by column
-    let mut columns: Vec<Vec<String>> = vec![Vec::new(); headers.len()];
-
-    for result in reader.records() {
-        let record = result?;
-        for (i, field) in record.iter().enumerate() {
-            if i < columns.len() {
-                columns[i].push(field.to_string());
-            }
-        }
-    }
+    let (headers, columns, _) = super::csv_io::read_csv_into_columns(
+        &csv.path,
+        csv.has_headers,
+        Some(csv.delimiter),
+        None,
+    )?;
 
     let table_name = csv
         .path

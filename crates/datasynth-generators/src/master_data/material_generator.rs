@@ -22,10 +22,14 @@ pub struct MaterialGeneratorConfig {
     pub bom_rate: f64,
     /// Default base unit of measure
     pub default_uom: String,
-    /// Gross margin range (min, max) as percentages
-    pub gross_margin_range: (f64, f64),
-    /// Standard cost range (min, max)
+    /// When set, standard cost is sampled from lognormal(μ, σ) for ln(cost), then clipped to standard_cost_range.
+    pub standard_cost_lognormal: Option<(f64, f64)>,
+    /// Standard cost range (min, max); used as clip bounds when lognormal set, else uniform sample.
     pub standard_cost_range: (Decimal, Decimal),
+    /// When set, gross margin is sampled from Normal(mean, std) clipped to gross_margin_range.
+    pub gross_margin_normal: Option<(f64, f64)>,
+    /// Gross margin range (min, max) as fraction; used as clip bounds when normal set, else uniform sample.
+    pub gross_margin_range: (f64, f64),
 }
 
 impl Default for MaterialGeneratorConfig {
@@ -47,8 +51,10 @@ impl Default for MaterialGeneratorConfig {
             ],
             bom_rate: 0.25,
             default_uom: "EA".to_string(),
-            gross_margin_range: (0.20, 0.50),
+            standard_cost_lognormal: None,
             standard_cost_range: (Decimal::from(10), Decimal::from(10_000)),
+            gross_margin_normal: None,
+            gross_margin_range: (0.20, 0.50),
         }
     }
 }
@@ -475,20 +481,34 @@ impl MaterialGenerator {
         }
     }
 
-    /// Generate standard cost.
+    /// Generate standard cost (lognormal when config has lognormal params, else uniform in range).
     fn generate_standard_cost(&mut self) -> Decimal {
         let min = self.config.standard_cost_range.0;
         let max = self.config.standard_cost_range.1;
-        let range = (max - min).to_string().parse::<f64>().unwrap_or(0.0);
-        let offset =
-            Decimal::from_f64_retain(self.rng.gen::<f64>() * range).unwrap_or(Decimal::ZERO);
-        (min + offset).round_dp(2)
+        let min_f = min.to_string().parse::<f64>().unwrap_or(10.0);
+        let max_f = max.to_string().parse::<f64>().unwrap_or(10_000.0);
+        let raw = if let Some((mu, sigma)) = self.config.standard_cost_lognormal {
+            use rand_distr::{Distribution, LogNormal};
+            let ln = LogNormal::new(mu, sigma).unwrap_or(LogNormal::new(0.0, 1.0).unwrap());
+            let x: f64 = ln.sample(&mut self.rng);
+            x.clamp(min_f, max_f)
+        } else {
+            min_f + self.rng.gen::<f64>() * (max_f - min_f)
+        };
+        Decimal::from_f64_retain(raw).unwrap_or(Decimal::ZERO).round_dp(2)
     }
 
-    /// Generate list price from standard cost.
+    /// Generate list price from standard cost (normal margin when config has normal params, else uniform in range).
     fn generate_list_price(&mut self, standard_cost: Decimal) -> Decimal {
         let (min_margin, max_margin) = self.config.gross_margin_range;
-        let margin = min_margin + self.rng.gen::<f64>() * (max_margin - min_margin);
+        let margin = if let Some((mean, std)) = self.config.gross_margin_normal {
+            use rand_distr::{Distribution, Normal};
+            let normal = Normal::new(mean, std).unwrap_or(Normal::new(0.3, 0.1).unwrap());
+            let x: f64 = normal.sample(&mut self.rng);
+            x.clamp(min_margin, max_margin)
+        } else {
+            min_margin + self.rng.gen::<f64>() * (max_margin - min_margin)
+        };
         let markup = Decimal::from_f64_retain(1.0 / (1.0 - margin)).unwrap_or(Decimal::from(2));
         (standard_cost * markup).round_dp(2)
     }

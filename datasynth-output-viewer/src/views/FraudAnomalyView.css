@@ -219,6 +219,20 @@
   min-height: 220px;
 }
 
+/* Scheme column: badge-style for multi-stage scheme anomalies */
+.fraud-anomaly-view .data-table td:nth-child(4) {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--scheme-accent, #9b59b6);
+}
+.fraud-anomaly-view .data-table td:nth-child(4):not(:empty) {
+  background: color-mix(in srgb, var(--scheme-accent, #9b59b6) 18%, transparent);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  width: 1%;
+  white-space: nowrap;
+}
+
 @media (prefers-color-scheme: light) {
   .chart-box {
     background: #f8f8f8;

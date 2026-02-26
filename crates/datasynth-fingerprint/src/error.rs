@@ -24,9 +24,13 @@ pub enum FingerprintError {
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
-    /// Error during CSV parsing.
+    /// Error during CSV parsing (legacy csv crate).
     #[error("CSV error: {0}")]
     Csv(#[from] csv::Error),
+
+    /// Error during CSV/DataFrame operations (Polars).
+    #[error("Polars/CSV error: {0}")]
+    Polars(String),
 
     /// Error during Parquet operations.
     #[error("Parquet error: {0}")]

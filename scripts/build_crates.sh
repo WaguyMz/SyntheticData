@@ -46,9 +46,9 @@ fi
 
 JOBS=$(($(nproc) - 2))
 if "$CHECK"; then
-    cargo check --release -j$JOBS
+    cargo check -j$JOBS
 else
-    cargo build --workspace --all-targets --release -j$JOBS
+    cargo build --workspace --all-targets  -j$JOBS
 fi
 
 

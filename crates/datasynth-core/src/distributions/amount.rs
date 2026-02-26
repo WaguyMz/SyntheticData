@@ -2,6 +2,9 @@
 //!
 //! Generates realistic transaction amounts using log-normal distributions
 //! and round-number bias commonly observed in accounting data.
+//! Supports per-account-class marginals (e.g. first 3 digits) for fingerprint-driven generation.
+
+use std::collections::HashMap;
 
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -10,6 +13,32 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::benford::{BenfordSampler, FraudAmountGenerator, FraudAmountPattern, ThresholdConfig};
+
+/// Lognormal parameters for a single side (debit or credit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LognormalParams {
+    pub lognormal_mu: f64,
+    pub lognormal_sigma: f64,
+}
+
+/// Per-account-class amount params (e.g. FEC first 3 digits: 411, 601).
+/// Used so generated line amounts mimic marginal distributions per class.
+/// Carries distributional stats (mean, std, lognormal μ/σ) for standalone JEs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountClassAmountParams {
+    pub debit: LognormalParams,
+    pub credit: LognormalParams,
+    /// Optional distributional stats (mean, std) for debit side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debit_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debit_std: Option<f64>,
+    /// Optional distributional stats (mean, std) for credit side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_std: Option<f64>,
+}
 
 /// Configuration for amount distribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +57,9 @@ pub struct AmountDistributionConfig {
     pub round_number_probability: f64,
     /// Probability of nice number (ending in 0 or 5)
     pub nice_number_probability: f64,
+    /// Per-account-class params (e.g. from fingerprint); when set, line amounts mimic those marginals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amounts_by_account_class: Option<HashMap<String, AccountClassAmountParams>>,
 }
 
 impl Default for AmountDistributionConfig {
@@ -40,6 +72,7 @@ impl Default for AmountDistributionConfig {
             decimal_places: 2,
             round_number_probability: 0.25, // 25% chance of .00 ending
             nice_number_probability: 0.15,  // 15% chance of nice numbers
+            amounts_by_account_class: None,
         }
     }
 }
@@ -55,6 +88,7 @@ impl AmountDistributionConfig {
             decimal_places: 2,
             round_number_probability: 0.30,
             nice_number_probability: 0.20,
+            amounts_by_account_class: None,
         }
     }
 
@@ -68,6 +102,7 @@ impl AmountDistributionConfig {
             decimal_places: 2,
             round_number_probability: 0.20,
             nice_number_probability: 0.15,
+            amounts_by_account_class: None,
         }
     }
 
@@ -81,6 +116,7 @@ impl AmountDistributionConfig {
             decimal_places: 2,
             round_number_probability: 0.15,
             nice_number_probability: 0.10,
+            amounts_by_account_class: None,
         }
     }
 }
@@ -319,6 +355,95 @@ impl AmountSampler {
         amounts
     }
 
+    /// Sample a single amount for a given account class and side (debit/credit).
+    /// When `amounts_by_account_class` is set and the class exists (or first digit, e.g. "1","2","3","6","7"),
+    /// uses that class's distributional params (lognormal μ/σ); otherwise uses the global config.
+    pub fn sample_for_class(&mut self, account_class: &str, is_debit: bool) -> Decimal {
+        let (mu, sigma) = if let Some(ref by_class) = self.config.amounts_by_account_class {
+            let params = by_class
+                .get(account_class)
+                .or_else(|| {
+                    account_class
+                        .chars()
+                        .next()
+                        .and_then(|c| by_class.get(&c.to_string()))
+                });
+            if let Some(ref params) = params {
+                let p = if is_debit { &params.debit } else { &params.credit };
+                (p.lognormal_mu, p.lognormal_sigma)
+            } else {
+                (self.config.lognormal_mu, self.config.lognormal_sigma)
+            }
+        } else {
+            (self.config.lognormal_mu, self.config.lognormal_sigma)
+        };
+
+        let lognormal = match LogNormal::new(mu, sigma) {
+            Ok(ln) => ln,
+            Err(_) => return self.sample_lognormal(),
+        };
+
+        let mut amount = lognormal.sample(&mut self.rng);
+        amount = amount.clamp(self.config.min_amount, self.config.max_amount);
+
+        let p: f64 = self.rng.gen();
+        if p < self.config.round_number_probability {
+            amount = (amount / 100.0).round() * 100.0;
+        } else if p < self.config.round_number_probability + self.config.nice_number_probability {
+            amount = (amount / 5.0).round() * 5.0;
+        }
+        amount = (amount * self.decimal_multiplier).round() / self.decimal_multiplier;
+        amount = amount.max(self.config.min_amount);
+
+        let amount_str = format!("{:.2}", amount);
+        amount_str.parse::<Decimal>().unwrap_or(Decimal::ONE)
+    }
+
+    /// Sample amounts per line using per-class marginals, then scale so they sum to `total`.
+    /// `line_specs`: (account_class, is_debit) for each line. When per-class config is absent,
+    /// falls back to global weights (same total split).
+    pub fn sample_summing_to_per_class(
+        &mut self,
+        line_specs: &[(String, bool)],
+        total: Decimal,
+    ) -> Vec<Decimal> {
+        use rust_decimal::prelude::ToPrimitive;
+
+        if line_specs.is_empty() {
+            return Vec::new();
+        }
+        if line_specs.len() == 1 {
+            return vec![total];
+        }
+
+        let mut amounts: Vec<Decimal> = line_specs
+            .iter()
+            .map(|(class, is_debit)| self.sample_for_class(class, *is_debit))
+            .collect();
+
+        let current_sum: Decimal = amounts.iter().copied().sum();
+        if current_sum.is_zero() {
+            return self.sample_summing_to(line_specs.len(), total);
+        }
+
+        let total_f64 = total.to_f64().unwrap_or(0.0);
+        let sum_f64 = current_sum.to_f64().unwrap_or(1.0);
+        let scale = total_f64 / sum_f64;
+
+        for amt in amounts.iter_mut() {
+            let a = amt.to_f64().unwrap_or(0.0) * scale;
+            let rounded = (a * self.decimal_multiplier).round() / self.decimal_multiplier;
+            *amt = Decimal::from_f64_retain(rounded).unwrap_or(Decimal::ZERO);
+        }
+
+        let new_sum: Decimal = amounts.iter().copied().sum();
+        let diff = total - new_sum;
+        let last_idx = amounts.len() - 1;
+        amounts[last_idx] += diff;
+
+        amounts
+    }
+
     /// Sample an amount within a specific range.
     pub fn sample_in_range(&mut self, min: Decimal, max: Decimal) -> Decimal {
         let min_f64 = min.to_string().parse::<f64>().unwrap_or(0.0);
@@ -428,6 +553,65 @@ mod tests {
 
         let sum: Decimal = amounts.iter().sum();
         assert_eq!(sum, total, "Sum {} doesn't match total {}", sum, total);
+    }
+
+    #[test]
+    fn test_sample_summing_to_per_class() {
+        use std::collections::HashMap;
+
+        let mut by_class = HashMap::new();
+        by_class.insert(
+            "411".to_string(),
+            AccountClassAmountParams {
+                debit: LognormalParams {
+                    lognormal_mu: 6.0,
+                    lognormal_sigma: 1.0,
+                },
+                credit: LognormalParams {
+                    lognormal_mu: 8.0,
+                    lognormal_sigma: 1.0,
+                },
+                debit_mean: None,
+                debit_std: None,
+                credit_mean: None,
+                credit_std: None,
+            },
+        );
+        by_class.insert(
+            "601".to_string(),
+            AccountClassAmountParams {
+                debit: LognormalParams {
+                    lognormal_mu: 7.0,
+                    lognormal_sigma: 1.2,
+                },
+                credit: LognormalParams {
+                    lognormal_mu: 5.0,
+                    lognormal_sigma: 0.8,
+                },
+                debit_mean: None,
+                debit_std: None,
+                credit_mean: None,
+                credit_std: None,
+            },
+        );
+
+        let config = AmountDistributionConfig {
+            min_amount: 1.0,
+            max_amount: 1_000_000.0,
+            amounts_by_account_class: Some(by_class),
+            ..Default::default()
+        };
+        let mut sampler = AmountSampler::with_config(42, config);
+
+        let specs = vec![
+            ("411".to_string(), true),
+            ("601".to_string(), true),
+        ];
+        let total = Decimal::from(10_000);
+        let amounts = sampler.sample_summing_to_per_class(&specs, total);
+        assert_eq!(amounts.len(), 2);
+        let sum: Decimal = amounts.iter().sum();
+        assert_eq!(sum, total);
     }
 
     #[test]

@@ -22,7 +22,7 @@ impl Extractor for CorrelationExtractor {
     ) -> FingerprintResult<ExtractedComponent> {
         let correlations = match data {
             DataSource::Csv(csv) => extract_from_csv(csv, config, privacy)?,
-            DataSource::Fec(fec) => extract_from_csv(&fec.as_csv(), config, privacy)?,
+            DataSource::Fec(fec) => extract_from_fec(fec, config, privacy)?,
             DataSource::Parquet(_) | DataSource::Json(_) => {
                 // For Parquet and JSON, reuse the same logic via memory conversion
                 // For now, return empty correlations (can be extended later)
@@ -42,49 +42,27 @@ impl Extractor for CorrelationExtractor {
     }
 }
 
-/// Extract correlations from CSV.
+/// Extract correlations from CSV (via Polars).
 fn extract_from_csv(
     csv: &super::CsvDataSource,
     _config: &ExtractionConfig,
     _privacy: &mut PrivacyEngine,
 ) -> FingerprintResult<CorrelationFingerprint> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(csv.has_headers)
-        .delimiter(csv.delimiter)
-        .from_path(&csv.path)?;
+    let (headers, columns, _) = super::csv_io::read_csv_into_columns(
+        &csv.path,
+        csv.has_headers,
+        Some(csv.delimiter),
+        None,
+    )?;
 
-    let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
-
-    // Collect numeric columns
-    let mut columns: Vec<Vec<f64>> = vec![Vec::new(); headers.len()];
-    let mut is_numeric: Vec<bool> = vec![true; headers.len()];
-
-    for result in reader.records() {
-        let record = result?;
-        for (i, field) in record.iter().enumerate() {
-            if i < columns.len() {
-                if let Ok(v) = field.parse::<f64>() {
-                    columns[i].push(v);
-                } else {
-                    is_numeric[i] = false;
-                }
-            }
+    let mut numeric_cols: Vec<(String, Vec<f64>)> = Vec::new();
+    for (i, name) in headers.iter().enumerate() {
+        let col = columns.get(i).map(|c| c.as_slice()).unwrap_or(&[]);
+        let values: Vec<f64> = col.iter().filter_map(|s| s.parse::<f64>().ok()).collect();
+        if !values.is_empty() && values.len() > col.len() / 2 {
+            numeric_cols.push((name.clone(), values));
         }
     }
-
-    // Filter to numeric columns
-    let numeric_cols: Vec<(String, Vec<f64>)> = headers
-        .into_iter()
-        .zip(columns)
-        .zip(is_numeric)
-        .filter_map(|((name, values), is_num)| {
-            if is_num && !values.is_empty() {
-                Some((name, values))
-            } else {
-                None
-            }
-        })
-        .collect();
 
     let table_name = csv
         .path
@@ -96,6 +74,53 @@ fn extract_from_csv(
 
     let mut correlations = CorrelationFingerprint::new();
     correlations.add_matrix(table_name, matrix);
+
+    Ok(correlations)
+}
+
+/// Extract correlations from FEC: only amount columns (Montant au débit, Montant au crédit, Montant en devise) are numeric.
+fn extract_from_fec(
+    fec: &super::FecDataSource,
+    _config: &ExtractionConfig,
+    _privacy: &mut PrivacyEngine,
+) -> FingerprintResult<CorrelationFingerprint> {
+    let csv = fec.as_csv();
+    let (headers, columns, _) = super::csv_io::read_csv_into_columns(
+        &csv.path,
+        csv.has_headers,
+        Some(csv.delimiter),
+        None,
+    )?;
+
+    let numeric_set: std::collections::HashSet<&str> =
+        super::FEC_NUMERIC_COLUMNS.iter().copied().collect();
+    let indices: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| numeric_set.contains(name.as_str()).then_some(i))
+        .collect();
+
+    let numeric_cols: Vec<(String, Vec<f64>)> = indices
+        .iter()
+        .map(|&i| {
+            let values: Vec<f64> = columns
+                .get(i)
+                .map(|c| c.iter().filter_map(|s| s.parse::<f64>().ok()).collect())
+                .unwrap_or_default();
+            (headers[i].clone(), values)
+        })
+        .collect();
+
+    let numeric_cols: Vec<(String, Vec<f64>)> = numeric_cols
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+
+    let table_name = fec.table_name();
+    let matrix = compute_correlation_matrix(&numeric_cols);
+
+    let mut correlations = CorrelationFingerprint::new();
+    correlations.add_matrix(&table_name, matrix);
 
     Ok(correlations)
 }

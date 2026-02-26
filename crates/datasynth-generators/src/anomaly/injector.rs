@@ -921,6 +921,18 @@ impl AnomalyInjector {
         }
     }
 
+    /// Advances all active fraud schemes using a pre-built context (accounts, counterparties, users).
+    /// Use this when the runtime supplies CoA and master data so schemes can pick targets.
+    pub fn advance_schemes_with_context(&mut self, context: &SchemeContext) -> Vec<SchemeAction> {
+        if let Some(ref mut advancer) = self.scheme_advancer {
+            let actions = advancer.advance_all(context);
+            self.scheme_actions.extend(actions.clone());
+            actions
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Potentially starts a new fraud scheme based on probabilities.
     ///
     /// Call this method periodically (e.g., once per period) to allow new

@@ -46,7 +46,8 @@ hex = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
-# CSV parsing for data extraction
+# CSV: Polars for robust reading (type inference, encoding); csv kept for tests and error type
+polars = { version = "0.53", default-features = false, features = ["csv", "temporal", "dtype-date", "dtype-datetime"] }
 csv = { workspace = true }
 
 # Parquet support

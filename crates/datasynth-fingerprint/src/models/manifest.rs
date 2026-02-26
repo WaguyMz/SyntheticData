@@ -156,6 +156,7 @@ impl PrivacyMetadata {
     /// Create privacy metadata from a privacy level.
     pub fn from_level(level: PrivacyLevel) -> Self {
         let (epsilon, k, outlier_percentile, min_occurrence) = match level {
+            PrivacyLevel::Tiny => (20.0, 1, 99.0, 1),
             PrivacyLevel::Minimal => (5.0, 3, 99.0, 3),
             PrivacyLevel::Standard | PrivacyLevel::Custom => (1.0, 5, 95.0, 5),
             PrivacyLevel::High => (0.5, 10, 90.0, 10),
@@ -193,6 +194,9 @@ impl PrivacyMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyLevel {
+    /// Tiny privacy protection (epsilon=20.0, k=1).
+    Tiny,
+    
     /// Minimal privacy protection (epsilon=5.0, k=3).
     /// Use for low-sensitivity data where utility is priority.
     Minimal,
@@ -220,6 +224,7 @@ impl PrivacyLevel {
     /// For `Custom`, returns 1.0 as a placeholder (actual value comes from config).
     pub fn epsilon(&self) -> f64 {
         match self {
+            Self::Tiny => 20.0,
             Self::Minimal => 5.0,
             Self::Standard => 1.0,
             Self::High => 0.5,
@@ -232,6 +237,7 @@ impl PrivacyLevel {
     /// For `Custom`, returns 5 as a placeholder (actual value comes from config).
     pub fn k_anonymity(&self) -> u32 {
         match self {
+            Self::Tiny => 1,
             Self::Minimal => 3,
             Self::Standard => 5,
             Self::High => 10,

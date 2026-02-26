@@ -162,6 +162,8 @@ AmountSampler {
 }
 ```
 
+When the fingerprint includes **per-account-class** amount stats (e.g. from FEC, first 3 digits of account), the synthesizer emits **`transactions.amounts_by_account_class`** in the config patch. The runtime applies this patch, and the journal entry generator uses it so that **line amounts are sampled from the marginal distribution for that account class** (debit/credit per class), improving fidelity at the per-class level (e.g. 4xx revenue vs 6xx expenses).
+
 ### Copula-Based Generation
 
 For correlated columns, the `GaussianCopula` preserves relationships:

@@ -4,6 +4,20 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Per-account-class amount statistics (e.g. FEC first 3 digits: 411, 601).
+/// Used to mimic amount distributions per large account class in synthetic data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountClassAmountStats {
+    /// Account class key (e.g. "411", "601" for first 3 digits).
+    pub account_class: String,
+    /// Number of lines (rows) in this class.
+    pub row_count: u64,
+    /// Statistics for debit amounts in this class.
+    pub debit_stats: NumericStats,
+    /// Statistics for credit amounts in this class.
+    pub credit_stats: NumericStats,
+}
+
 /// Statistics fingerprint containing distribution information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatisticsFingerprint {
@@ -19,6 +33,12 @@ pub struct StatisticsFingerprint {
     /// Global Benford's Law analysis for amount fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub benford_analysis: Option<BenfordStats>,
+
+    /// Per-account-class amount distributions (e.g. FEC level 3: first 3 digits of account).
+    /// Key = account class (e.g. "411", "601"); synthetic generation should mimic these.
+    /// Always serialized in JSON (as null when absent) so the structure is visible.
+    #[serde(default)]
+    pub amount_by_account_class: Option<HashMap<String, AccountClassAmountStats>>,
 }
 
 impl StatisticsFingerprint {
@@ -29,7 +49,13 @@ impl StatisticsFingerprint {
             categorical_columns: HashMap::new(),
             temporal_columns: HashMap::new(),
             benford_analysis: None,
+            amount_by_account_class: None,
         }
+    }
+
+    /// Set per-account-class amount stats (e.g. from FEC extraction).
+    pub fn set_amount_by_account_class(&mut self, map: HashMap<String, AccountClassAmountStats>) {
+        self.amount_by_account_class = Some(map);
     }
 
     /// Add numeric statistics for a column.

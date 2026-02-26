@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::models::{
     AccountSubType, AccountType, ChartOfAccounts, CoAComplexity, GLAccount, IndustrySector,
 };
+use crate::pcg::control_accounts;
 
 /// Root of the PCG JSON: array of top-level classes (1–8).
 pub type PcgRoot = Vec<PcgNode>;
@@ -183,6 +184,28 @@ pub fn build_chart_of_accounts_from_pcg_2024(
         coa.add_account(account);
     }
 
+    // When complexity caps total accounts, class 1 can fill the quota and class 4 (401/411) is
+    // never added. Document flow JEs and FEC output require 401000 (AP) and 411000 (AR), so
+    // ensure they are always present.
+    use AccountSubType::{AccountsPayable, AccountsReceivable};
+    use AccountType::{Asset, Liability};
+    if coa.get_account(control_accounts::AP_CONTROL).is_none() {
+        coa.add_account(GLAccount::new(
+            control_accounts::AP_CONTROL.to_string(),
+            "Fournisseurs".to_string(),
+            Liability,
+            AccountsPayable,
+        ));
+    }
+    if coa.get_account(control_accounts::AR_CONTROL).is_none() {
+        coa.add_account(GLAccount::new(
+            control_accounts::AR_CONTROL.to_string(),
+            "Clients".to_string(),
+            Asset,
+            AccountsReceivable,
+        ));
+    }
+
     Ok(coa)
 }
 
@@ -273,5 +296,14 @@ mod tests {
         assert_eq!(coa.country, "FR");
         assert!(coa.account_count() >= 50);
         assert!(coa.account_count() <= 150);
+        // Small complexity fills quota with class 1; we always ensure 401/411 for document flows
+        assert!(
+            coa.get_account(control_accounts::AP_CONTROL).is_some(),
+            "CoA must include 401000 (Fournisseurs/AP) for French document flow JEs"
+        );
+        assert!(
+            coa.get_account(control_accounts::AR_CONTROL).is_some(),
+            "CoA must include 411000 (Clients/AR) for French document flow JEs"
+        );
     }
 }

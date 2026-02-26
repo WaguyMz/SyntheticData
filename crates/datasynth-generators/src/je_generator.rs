@@ -199,7 +199,11 @@ impl JournalEntryGenerator {
                 config.even_odd_distribution.clone(),
                 config.debit_credit_distribution.clone(),
             ),
-            amount_sampler: AmountSampler::with_config(seed + 2, config.amounts.clone()),
+            amount_sampler: if config.benford.enabled {
+                AmountSampler::with_benford(seed + 2, config.amounts.clone())
+            } else {
+                AmountSampler::with_config(seed + 2, config.amounts.clone())
+            },
             temporal_sampler: TemporalSampler::with_config(
                 seed + 3,
                 config.seasonality.clone(),
@@ -881,12 +885,42 @@ impl JournalEntryGenerator {
             self.apply_human_variation(drift_adjusted_amount)
         };
 
+        // Select accounts first (so we can use per-account-class amount distributions when set)
+        let debit_accounts: Vec<String> = (0..line_spec.debit_count)
+            .map(|_| self.select_debit_account().account_number.clone())
+            .collect();
+        let credit_accounts: Vec<String> = (0..line_spec.credit_count)
+            .map(|_| self.select_credit_account().account_number.clone())
+            .collect();
+
+        let (debit_amounts, credit_amounts) = if self.config.amounts.amounts_by_account_class.is_some() {
+            let debit_specs: Vec<(String, bool)> = debit_accounts
+                .iter()
+                .map(|a| (Self::account_class(a), true))
+                .collect();
+            let credit_specs: Vec<(String, bool)> = credit_accounts
+                .iter()
+                .map(|a| (Self::account_class(a), false))
+                .collect();
+            let debit_amounts = self
+                .amount_sampler
+                .sample_summing_to_per_class(&debit_specs, total_amount);
+            let credit_amounts = self
+                .amount_sampler
+                .sample_summing_to_per_class(&credit_specs, total_amount);
+            (debit_amounts, credit_amounts)
+        } else {
+            let debit_amounts = self
+                .amount_sampler
+                .sample_summing_to(line_spec.debit_count, total_amount);
+            let credit_amounts = self
+                .amount_sampler
+                .sample_summing_to(line_spec.credit_count, total_amount);
+            (debit_amounts, credit_amounts)
+        };
+
         // Generate debit lines
-        let debit_amounts = self
-            .amount_sampler
-            .sample_summing_to(line_spec.debit_count, total_amount);
-        for (i, amount) in debit_amounts.into_iter().enumerate() {
-            let account_number = self.select_debit_account().account_number.clone();
+        for (i, (account_number, amount)) in debit_accounts.into_iter().zip(debit_amounts).enumerate() {
             let mut line = JournalEntryLine::debit(
                 entry.header.document_id,
                 (i + 1) as u32,
@@ -906,12 +940,8 @@ impl JournalEntryGenerator {
             entry.add_line(line);
         }
 
-        // Generate credit lines - use the SAME amounts to ensure balance
-        let credit_amounts = self
-            .amount_sampler
-            .sample_summing_to(line_spec.credit_count, total_amount);
-        for (i, amount) in credit_amounts.into_iter().enumerate() {
-            let account_number = self.select_credit_account().account_number.clone();
+        // Generate credit lines - use the SAME total to ensure balance
+        for (i, (account_number, amount)) in credit_accounts.into_iter().zip(credit_amounts).enumerate() {
             let mut line = JournalEntryLine::credit(
                 entry.header.document_id,
                 (line_spec.debit_count + i + 1) as u32,
@@ -1708,6 +1738,15 @@ impl JournalEntryGenerator {
         } else {
             BusinessProcess::A2R
         }
+    }
+
+    /// First 3 digit characters of the account (e.g. FEC account class for per-class marginals).
+    fn account_class(account_number: &str) -> String {
+        account_number
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(3)
+            .collect()
     }
 
     fn select_debit_account(&mut self) -> &GLAccount {

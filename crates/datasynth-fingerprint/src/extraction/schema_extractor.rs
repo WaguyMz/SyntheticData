@@ -6,7 +6,10 @@ use crate::error::{FingerprintError, FingerprintResult};
 use crate::models::{DataType, FieldSchema, SchemaFingerprint, TableSchema};
 use crate::privacy::PrivacyEngine;
 
-use super::{DataSource, ExtractedComponent, ExtractionConfig, Extractor};
+use super::{
+    is_fec_numeric_column, is_gl_amount_column, is_temporal_header, DataSource, ExtractedComponent,
+    ExtractionConfig, Extractor,
+};
 
 /// Extractor for schema information.
 pub struct SchemaExtractor;
@@ -24,7 +27,7 @@ impl Extractor for SchemaExtractor {
     ) -> FingerprintResult<ExtractedComponent> {
         let schema = match data {
             DataSource::Csv(csv) => extract_from_csv(csv, config, privacy)?,
-            DataSource::Fec(fec) => extract_from_csv(&fec.as_csv(), config, privacy)?,
+            DataSource::Fec(fec) => extract_from_fec(fec, config, privacy)?,
             DataSource::Parquet(pq) => extract_from_parquet(pq, config, privacy)?,
             DataSource::Json(json) => extract_from_json(json, config, privacy)?,
             DataSource::Memory(mem) => extract_from_memory(mem, config, privacy)?,
@@ -41,33 +44,19 @@ impl Extractor for SchemaExtractor {
     }
 }
 
-/// Extract schema from CSV.
+/// Extract schema from CSV (via Polars for robust parsing and type inference).
 fn extract_from_csv(
     csv: &super::CsvDataSource,
     config: &ExtractionConfig,
     privacy: &mut PrivacyEngine,
 ) -> FingerprintResult<SchemaFingerprint> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(csv.has_headers)
-        .delimiter(csv.delimiter)
-        .from_path(&csv.path)?;
+    let (headers, columns, row_count) = super::csv_io::read_csv_into_columns(
+        &csv.path,
+        csv.has_headers,
+        Some(csv.delimiter),
+        None,
+    )?;
 
-    let headers: Vec<String> = reader.headers()?.iter().map(|s| s.to_string()).collect();
-
-    // Sample rows to infer types
-    let mut sample_rows: Vec<Vec<String>> = Vec::new();
-    let mut row_count = 0u64;
-
-    for result in reader.records() {
-        let record = result?;
-        row_count += 1;
-
-        if sample_rows.len() < 1000 {
-            sample_rows.push(record.iter().map(|s| s.to_string()).collect());
-        }
-    }
-
-    // Check minimum rows
     if row_count < config.min_rows as u64 {
         return Err(FingerprintError::InsufficientData {
             required: config.min_rows,
@@ -75,19 +64,28 @@ fn extract_from_csv(
         });
     }
 
-    // Infer column types
-    let columns: Vec<FieldSchema> = headers
+    // Infer column types: amount columns → Decimal, date/temporal columns → Date, else infer from values
+    let schema_columns: Vec<FieldSchema> = headers
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let values: Vec<&str> = sample_rows
-                .iter()
-                .filter_map(|row| row.get(i).map(|s| s.as_str()))
-                .collect();
+            let values: Vec<&str> = columns
+                .get(i)
+                .map(|c| c.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
 
-            let data_type = infer_data_type(&values);
-            let null_rate =
-                values.iter().filter(|v| v.is_empty()).count() as f64 / values.len() as f64;
+            let data_type = if is_gl_amount_column(name) {
+                DataType::Decimal
+            } else if is_temporal_header(name) || infer_data_type(&values) == DataType::Date {
+                DataType::Date
+            } else {
+                infer_data_type(&values)
+            };
+            let null_rate = if values.is_empty() {
+                0.0
+            } else {
+                values.iter().filter(|v| v.is_empty()).count() as f64 / values.len() as f64
+            };
             let cardinality = estimate_cardinality(&values);
 
             FieldSchema::new(name.clone(), data_type)
@@ -96,7 +94,6 @@ fn extract_from_csv(
         })
         .collect();
 
-    // Add noise to row count
     let noised_row_count = privacy.add_noise_to_count(row_count, "schema.row_count")?;
 
     let table_name = csv
@@ -107,7 +104,68 @@ fn extract_from_csv(
         .to_string();
 
     let mut table = TableSchema::new(&table_name, noised_row_count);
-    for col in columns {
+    for col in schema_columns {
+        table.add_column(col);
+    }
+
+    let mut schema = SchemaFingerprint::new();
+    schema.add_table(table_name, table);
+
+    Ok(schema)
+}
+
+/// Extract schema from FEC (Fichier des Écritures Comptables).
+/// Only amount columns (Montant au débit, Montant au crédit, Montant en devise) are numeric; all others are categorical (String).
+fn extract_from_fec(
+    fec: &super::FecDataSource,
+    config: &ExtractionConfig,
+    privacy: &mut PrivacyEngine,
+) -> FingerprintResult<SchemaFingerprint> {
+    let csv = fec.as_csv();
+    let (headers, columns, row_count) = super::csv_io::read_csv_into_columns(
+        &csv.path,
+        csv.has_headers,
+        Some(csv.delimiter),
+        None,
+    )?;
+
+    if row_count < config.min_rows as u64 {
+        return Err(FingerprintError::InsufficientData {
+            required: config.min_rows,
+            actual: row_count as usize,
+        });
+    }
+
+    let schema_columns: Vec<FieldSchema> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let values: Vec<&str> = columns
+                .get(i)
+                .map(|c| c.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            let data_type = if is_fec_numeric_column(name) {
+                DataType::Decimal
+            } else {
+                DataType::String
+            };
+            let null_rate = if values.is_empty() {
+                0.0
+            } else {
+                values.iter().filter(|v| v.is_empty()).count() as f64 / values.len() as f64
+            };
+            let cardinality = estimate_cardinality(&values);
+
+            FieldSchema::new(name.clone(), data_type)
+                .with_nullable(null_rate)
+                .with_cardinality(cardinality)
+        })
+        .collect();
+
+    let noised_row_count = privacy.add_noise_to_count(row_count, "schema.row_count")?;
+    let table_name = fec.table_name();
+    let mut table = TableSchema::new(&table_name, noised_row_count);
+    for col in schema_columns {
         table.add_column(col);
     }
 

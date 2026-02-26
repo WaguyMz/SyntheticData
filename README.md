@@ -853,7 +853,7 @@ See **[datasynth-output-viewer/README.md](datasynth-output-viewer/README.md)** f
 Extract privacy-preserving fingerprints from real data and generate matching synthetic data:
 
 ```bash
-# Extract fingerprint from CSV data
+# Extract fingerprint from CSV data (writes fingerprint.dsf and fingerprint.json)
 datasynth-data fingerprint extract \
     --input ./real_data.csv \
     --output ./fingerprint.dsf \

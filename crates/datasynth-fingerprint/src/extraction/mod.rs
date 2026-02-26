@@ -98,6 +98,7 @@
 
 mod anomaly_extractor;
 mod correlation_extractor;
+mod csv_io;
 mod integrity_extractor;
 mod rules_extractor;
 mod schema_extractor;
@@ -122,10 +123,22 @@ use crate::models::{
 use crate::privacy::{PrivacyConfig, PrivacyEngine};
 
 /// Configuration for fingerprint extraction.
+/// Accounting standards for extraction (controls delimiter and which columns are numeric).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountingStandards {
+    /// US GAAP (or other non-French): comma CSV, infer numeric from data.
+    #[default]
+    UsGaap,
+    /// French GAAP (FEC / PCG): semicolon-delimited, only amount columns (débit/crédit) are numeric; date columns are temporal.
+    FrenchGaap,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractionConfig {
     /// Privacy configuration.
     pub privacy: PrivacyConfig,
+    /// Accounting standards: us_gaap (default) or french_gaap (FEC-style: semicolon, amount-only numeric, dates temporal).
+    pub accounting_standards: AccountingStandards,
     /// Whether to extract correlations.
     pub extract_correlations: bool,
     /// Whether to extract integrity constraints.
@@ -154,6 +167,7 @@ impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
             privacy: PrivacyConfig::from_level(PrivacyLevel::Standard),
+            accounting_standards: AccountingStandards::UsGaap,
             extract_correlations: true,
             extract_integrity: true,
             extract_rules: true,
@@ -215,6 +229,82 @@ pub enum DataSource {
     Directory(DirectoryDataSource),
     /// In-memory data.
     Memory(MemoryDataSource),
+}
+
+/// FEC (Fichier des Écritures Comptables): only these columns are numeric (amounts).
+/// All other 18 mandatory columns (journal code, labels, dates, account numbers, etc.) are categorical.
+pub const FEC_NUMERIC_COLUMNS: &[&str] = &[
+    "Montant au débit",
+    "Montant au crédit",
+    "Montant en devise",
+];
+
+/// FEC column containing the GL account number (for per-account-class amount stats).
+pub const FEC_ACCOUNT_COLUMN: &str = "Numéro de compte";
+
+/// Maximum prefix length for account class (1, 2, or 3 digits). Level 3 = first 3 digits.
+pub const FEC_ACCOUNT_CLASS_LEVEL: usize = 3;
+
+/// Minimum number of rows per account class to include in fingerprint (privacy & stability).
+pub const FEC_MIN_ROWS_PER_CLASS: usize = 5;
+
+/// Returns true if the column name is one of the FEC numeric (amount) columns.
+#[inline]
+pub fn is_fec_numeric_column(name: &str) -> bool {
+    FEC_NUMERIC_COLUMNS.contains(&name)
+}
+
+/// Returns true if the column is a GL amount column (debit/credit), FEC or generic (e.g. Debit, Credit).
+/// Used by schema extractor to set data_type to Decimal so distributional stats are meaningful.
+#[inline]
+pub fn is_gl_amount_column(name: &str) -> bool {
+    if is_fec_numeric_column(name) {
+        return true;
+    }
+    let lower = name.trim().to_lowercase();
+    lower == "debit"
+        || lower == "credit"
+        || lower == "debit_amount"
+        || lower == "credit_amount"
+        || lower == "dr"
+        || lower == "cr"
+        || lower == "amount_dr"
+        || lower == "amount_cr"
+        || (lower.contains("montant") && (lower.contains("débit") || lower.contains("crédit") || lower.contains("devise")))
+}
+
+/// Header substrings that indicate a date/temporal column (schema should set DataType::Date).
+pub const TEMPORAL_HEADER_PATTERNS: &[&str] = &[
+    "date",
+    "ecrituredate",
+    "piece date",
+    "piecedate",
+    "ecriture_date",
+    "piece_date",
+    "datemouvement",
+    "date_ecriture",
+    "date_piece",
+];
+
+/// Returns true if the column name indicates a date/temporal column.
+#[inline]
+pub fn is_temporal_header(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    TEMPORAL_HEADER_PATTERNS
+        .iter()
+        .any(|p| lower.contains(&p.to_lowercase()))
+}
+
+/// Truncate the existing account number to the first `level` digits to get the subclass (e.g. "411000" -> "411").
+/// Used for stats by subclass: aggregate debit/credit by this truncated key.
+#[inline]
+pub fn fec_account_class(account: &str, level: usize) -> String {
+    account
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(level)
+        .collect()
 }
 
 /// FEC (Fichier des Écritures Comptables) data source.
@@ -843,6 +933,10 @@ impl FingerprintExtractor {
                 }
                 for (key, categorical) in stats.categorical_columns {
                     merged_stats.categorical_columns.insert(key, categorical);
+                }
+                // Preserve per-account-class amount stats (e.g. from single CSV with CompteNum/Debit/Credit)
+                if let Some(by_class) = stats.amount_by_account_class {
+                    merged_stats.set_amount_by_account_class(by_class);
                 }
             }
 

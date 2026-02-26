@@ -93,6 +93,10 @@ export interface AnomalyLabel {
   causal_reason_type?: string;
   /** Display: scenario_id || cluster_id || causal_reason_type (filled in viewer so scenario is never empty) */
   scenario_display?: string;
+  /** Friendly type for display (e.g. multi-stage scheme types); set in viewer from anomaly_type */
+  type_display?: string;
+  /** True when label is from a multi-stage fraud scheme (scenario_id set by runtime) */
+  is_scheme?: boolean;
   [key: string]: unknown;
 }
 

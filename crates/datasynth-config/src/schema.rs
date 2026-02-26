@@ -2240,6 +2240,26 @@ pub struct MaterialMasterConfig {
     /// Maximum BOM depth
     #[serde(default = "default_max_bom_depth")]
     pub max_bom_depth: u8,
+    /// Optional standard cost distribution (lognormal): ln(price) ~ N(mu, sigma). From FEC 6xx debit stats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_cost_lognormal_mu: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_cost_lognormal_sigma: Option<f64>,
+    /// Optional standard cost clip bounds when using lognormal (min, max). If unset, generator may use ±3 sigma.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_cost_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_cost_max: Option<f64>,
+    /// Optional gross margin distribution: margin ~ Normal(mean, std) clipped to [0,1]. From FEC 7xx/6xx ratio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gross_margin_mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gross_margin_std: Option<f64>,
+    /// Optional gross margin clip bounds when using normal (min, max).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gross_margin_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gross_margin_max: Option<f64>,
 }
 
 fn default_material_count() -> usize {
@@ -2262,6 +2282,14 @@ impl Default for MaterialMasterConfig {
             valuation_distribution: ValuationMethodDistribution::default(),
             bom_percent: default_bom_percent(),
             max_bom_depth: default_max_bom_depth(),
+            standard_cost_lognormal_mu: None,
+            standard_cost_lognormal_sigma: None,
+            standard_cost_min: None,
+            standard_cost_max: None,
+            gross_margin_mean: None,
+            gross_margin_std: None,
+            gross_margin_min: None,
+            gross_margin_max: None,
         }
     }
 }

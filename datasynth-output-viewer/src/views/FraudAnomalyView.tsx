@@ -19,12 +19,13 @@ import './FraudAnomalyView.css';
 const TABLE_COLUMNS = [
   { key: 'anomaly_id', label: 'ID', width: '120px' },
   { key: 'anomaly_category', label: 'Category', width: '100px' },
-  { key: 'anomaly_type', label: 'Type', width: '140px' },
+  { key: 'type_display', label: 'Type', width: '200px' },
+  { key: 'scheme_badge', label: 'Scheme', width: '64px' },
   { key: 'document_id', label: 'Document ID', width: '140px' },
   { key: 'company_code', label: 'Company', width: '80px' },
   { key: 'anomaly_date', label: 'Date', width: '100px' },
   { key: 'severity', label: 'Severity', width: '70px' },
-  { key: 'scenario_display', label: 'Scenario / Scheme', width: '140px' },
+  { key: 'scenario_display', label: 'Scenario / Scheme', width: '160px' },
   { key: 'description', label: 'Description', width: '220px' },
   { key: 'monetary_impact', label: 'Impact', width: '100px' },
 ];
@@ -71,15 +72,40 @@ function formatNum(v: unknown): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-/** Fill scenario_display so the Scenario column is never empty: scenario_id || cluster_id || causal_reason_type */
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Friendly display name for anomaly types (especially multi-stage scheme types). */
+function friendlyTypeName(anomalyType: string | undefined): string {
+  if (!anomalyType) return '—';
+  const t = String(anomalyType);
+  if (t === 'FictitiousTransaction' || t.includes('FictitiousTransaction')) return 'Multi-stage: Fictitious entry';
+  if (t === 'RevenueManipulation' || t.includes('RevenueManipulation')) return 'Multi-stage: Revenue manipulation';
+  if (t === 'VendorKickback' || t.includes('VendorKickback')) return 'Multi-stage: Vendor kickback';
+  if (t.includes('Embezzlement')) return 'Multi-stage: Embezzlement';
+  return t;
+}
+
+/** Fill scenario_display and type_display so Scenario/Type columns and charts look good for schemes. */
 function normalizeLabels(rows: AnomalyLabel[]): AnomalyLabel[] {
   return rows.map((r) => {
-    const scenario =
-      (r.scenario_id as string)?.trim() ||
-      (r.cluster_id as string)?.trim() ||
-      (r.causal_reason_type as string)?.trim() ||
-      '—';
-    return { ...r, scenario_display: scenario };
+    const scenarioId = (r.scenario_id as string)?.trim();
+    const clusterId = (r.cluster_id as string)?.trim();
+    const causal = (r.causal_reason_type as string)?.trim();
+    let scenario: string;
+    if (scenarioId) {
+      scenario = UUID_REGEX.test(scenarioId) ? `Scheme: ${scenarioId.slice(0, 8)}…` : scenarioId;
+    } else {
+      scenario = clusterId || causal || '—';
+    }
+    const typeDisplay = friendlyTypeName(r.anomaly_type as string);
+    const isScheme = Boolean(scenarioId);
+    return {
+      ...r,
+      scenario_display: scenario,
+      type_display: typeDisplay,
+      is_scheme: isScheme,
+      scheme_badge: isScheme ? 'Scheme' : '',
+    };
   });
 }
 
@@ -144,7 +170,7 @@ export function FraudAnomalyView() {
   const byType = useMemo(() => {
     const map: Record<string, number> = {};
     filteredLabels.forEach((l) => {
-      const t = (l.anomaly_type ?? 'Other') as string;
+      const t = ((l.type_display ?? l.anomaly_type) ?? 'Other') as string;
       map[t] = (map[t] ?? 0) + 1;
     });
     return Object.entries(map)
@@ -203,8 +229,9 @@ export function FraudAnomalyView() {
     <div className="fraud-anomaly-view">
       <h2>Fraud, Anomalies &amp; Schemes</h2>
       <p className="fraud-anomaly-desc">
-        Labels from <code>labels/anomaly_labels</code> and <code>labels/fraud_labels</code>. Click a row to view the
-        concerned transaction. Scenario shows scheme/cluster or causal reason when no scenario_id is set.
+        Labels from <code>labels/anomaly_labels</code> and <code>labels/fraud_labels</code>. Multi-stage scheme
+        anomalies (embezzlement, revenue manipulation, kickback) show a <strong>Scheme</strong> badge and a short
+        scheme ID in Scenario / Scheme. Click a row to view the concerned transaction.
       </p>
       {labels.length === 0 ? (
         <p className="fraud-anomaly-empty">

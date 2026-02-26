@@ -54,6 +54,8 @@ use datasynth_generators::{
     // Anomaly injection
     AnomalyInjector,
     AnomalyInjectorConfig,
+    SchemeActionType,
+    SchemeContext,
     AssetGenerator,
     // Audit generators
     AuditEngagementGenerator,
@@ -88,6 +90,7 @@ use datasynth_generators::{
     JudgmentGenerator,
     LatePaymentDistribution,
     MaterialGenerator,
+    MaterialGeneratorConfig,
     O2CDocumentChain,
     O2CGenerator,
     O2CGeneratorConfig,
@@ -1232,8 +1235,27 @@ impl EnhancedOrchestrator {
             Self::base_config_for_industry("manufacturing")
         };
 
-        // Apply the synthesized patches
+        // Apply the synthesized patches (fingerprint does not patch fraud/anomaly; see config_synthesizer)
         config = Self::apply_config_patch(config, &synthesis_result.config_patch);
+
+        // If fingerprint has per-account-class stats with French PCG-style classes (4xx, 6xx, 7xx),
+        // enable French GAAP so the generated chart of accounts includes 401, 411, 601, 701, etc.
+        // Otherwise the CoA would be US-style (1100, 2000) and classes 401/411 would never appear.
+        if let Some(ref by_class) = fingerprint.statistics.amount_by_account_class {
+            let has_french_classes = by_class.keys().any(|k| {
+                k.starts_with('4') || k.starts_with('6') || k.starts_with('7')
+            });
+            if has_french_classes {
+                config.accounting_standards.enabled = true;
+                config.accounting_standards.framework =
+                    Some(datasynth_config::schema::AccountingFrameworkConfig::FrenchGaap);
+                info!(
+                    "Fingerprint has French PCG account classes (4xx/6xx/7xx); enabling French GAAP for CoA so 401, 411, etc. appear in generated data"
+                );
+            }
+        }
+
+        // Use the existing config as-is: no forcing of fraud, anomaly_injection, or benford.
 
         // Log synthesis results
         info!(
@@ -1329,6 +1351,68 @@ impl EnhancedOrchestrator {
                 }
                 ("anomaly_injection.overall_rate", ConfigValue::Float(f)) => {
                     config.fraud.fraud_rate = *f;
+                }
+                // Fingerprint-driven amount distribution (global)
+                ("transactions.amounts.min_amount", ConfigValue::Float(f)) => {
+                    config.transactions.amounts.min_amount = *f;
+                }
+                ("transactions.amounts.max_amount", ConfigValue::Float(f)) => {
+                    config.transactions.amounts.max_amount = *f;
+                }
+                ("transactions.amounts.lognormal_mu", ConfigValue::Float(f)) => {
+                    config.transactions.amounts.lognormal_mu = *f;
+                }
+                ("transactions.amounts.lognormal_sigma", ConfigValue::Float(f)) => {
+                    config.transactions.amounts.lognormal_sigma = *f;
+                }
+                ("transactions.amounts.round_number_probability", ConfigValue::Float(f)) => {
+                    config.transactions.amounts.round_number_probability = *f;
+                }
+                // Per-account-class marginals (e.g. FEC first 3 digits) so generated data mimics those distributions
+                ("transactions.amounts_by_account_class", ConfigValue::String(s)) => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<std::collections::HashMap<
+                            String,
+                            datasynth_core::distributions::AccountClassAmountParams,
+                        >>(s)
+                    {
+                        config.transactions.amounts.amounts_by_account_class = Some(parsed);
+                        info!(
+                            "Applied amounts_by_account_class: {} classes",
+                            config
+                                .transactions
+                                .amounts
+                                .amounts_by_account_class
+                                .as_ref()
+                                .map(|m| m.len())
+                                .unwrap_or(0)
+                        );
+                    }
+                }
+                // FEC-derived material distributional stats (6xx achats, 7xx ventes)
+                ("master_data.materials.standard_cost_lognormal_mu", ConfigValue::Float(f)) => {
+                    config.master_data.materials.standard_cost_lognormal_mu = Some(*f);
+                }
+                ("master_data.materials.standard_cost_lognormal_sigma", ConfigValue::Float(f)) => {
+                    config.master_data.materials.standard_cost_lognormal_sigma = Some(*f);
+                }
+                ("master_data.materials.standard_cost_min", ConfigValue::Float(f)) => {
+                    config.master_data.materials.standard_cost_min = Some(*f);
+                }
+                ("master_data.materials.standard_cost_max", ConfigValue::Float(f)) => {
+                    config.master_data.materials.standard_cost_max = Some(*f);
+                }
+                ("master_data.materials.gross_margin_mean", ConfigValue::Float(f)) => {
+                    config.master_data.materials.gross_margin_mean = Some(*f);
+                }
+                ("master_data.materials.gross_margin_std", ConfigValue::Float(f)) => {
+                    config.master_data.materials.gross_margin_std = Some(*f);
+                }
+                ("master_data.materials.gross_margin_min", ConfigValue::Float(f)) => {
+                    config.master_data.materials.gross_margin_min = Some(*f);
+                }
+                ("master_data.materials.gross_margin_max", ConfigValue::Float(f)) => {
+                    config.master_data.materials.gross_margin_max = Some(*f);
                 }
                 _ => {
                     debug!("Ignoring unknown config patch key: {}", key);
@@ -1991,7 +2075,7 @@ impl EnhancedOrchestrator {
     /// Phase 5: Inject anomalies into journal entries.
     fn phase_anomaly_injection(
         &mut self,
-        entries: &mut [JournalEntry],
+        entries: &mut Vec<JournalEntry>,
         actions: &DegradationActions,
         stats: &mut EnhancedGenerationStatistics,
     ) -> SynthResult<AnomalyLabels> {
@@ -2009,7 +2093,9 @@ impl EnhancedOrchestrator {
             warn!("Phase 5: Skipped due to resource degradation");
             Ok(AnomalyLabels::default())
         } else {
-            debug!("Phase 5: Skipped (anomaly injection disabled or no entries)");
+            info!(
+                "Phase 5: Skipped (anomaly injection disabled or no entries; enable fraud.enabled or anomaly_injection.enabled in config to generate anomalies)"
+            );
             Ok(AnomalyLabels::default())
         }
     }
@@ -4977,6 +5063,41 @@ impl EnhancedOrchestrator {
         Ok(coa)
     }
 
+    /// Build material generator config from master_data.materials (FEC-derived distributional stats when patched).
+    fn material_config_from_master_data(&self) -> MaterialGeneratorConfig {
+        let default = MaterialGeneratorConfig::default();
+        let mat = &self.config.master_data.materials;
+        let standard_cost_lognormal = match (
+            mat.standard_cost_lognormal_mu,
+            mat.standard_cost_lognormal_sigma,
+        ) {
+            (Some(mu), Some(sigma)) if sigma > 0.0 && sigma.is_finite() => Some((mu, sigma)),
+            _ => None,
+        };
+        let standard_cost_range = match (mat.standard_cost_min, mat.standard_cost_max) {
+            (Some(min), Some(max)) if min > 0.0 && max >= min => (
+                rust_decimal::Decimal::from_f64_retain(min).unwrap_or(rust_decimal::Decimal::from(10)),
+                rust_decimal::Decimal::from_f64_retain(max).unwrap_or(rust_decimal::Decimal::from(10_000)),
+            ),
+            _ => default.standard_cost_range,
+        };
+        let gross_margin_normal = match (mat.gross_margin_mean, mat.gross_margin_std) {
+            (Some(mean), Some(std)) if std >= 0.0 && std.is_finite() => Some((mean, std)),
+            _ => None,
+        };
+        let gross_margin_range = match (mat.gross_margin_min, mat.gross_margin_max) {
+            (Some(min), Some(max)) if min >= 0.0 && max <= 1.0 && max >= min => (min, max),
+            _ => default.gross_margin_range,
+        };
+        MaterialGeneratorConfig {
+            standard_cost_lognormal,
+            standard_cost_range,
+            gross_margin_normal,
+            gross_margin_range,
+            ..default
+        }
+    }
+
     /// Generate master data entities.
     fn generate_master_data(&mut self) -> SynthResult<()> {
         let start_date = NaiveDate::parse_from_str(&self.config.global.start_date, "%Y-%m-%d")
@@ -5018,8 +5139,9 @@ impl EnhancedOrchestrator {
                 pb.inc(1);
             }
 
-            // Generate materials
-            let mut material_gen = MaterialGenerator::new(company_seed + 200);
+            // Generate materials (use FEC-derived ranges when patched)
+            let material_config = self.material_config_from_master_data();
+            let mut material_gen = MaterialGenerator::with_config(company_seed + 200, material_config);
             material_gen.set_country_pack(pack.clone());
             let material_pool = material_gen.generate_material_pool(
                 self.phase_config.materials_per_company,
@@ -6271,8 +6393,165 @@ impl EnhancedOrchestrator {
         })
     }
 
+    /// Run multi-stage fraud schemes (embezzlement, revenue manipulation, kickback) to produce
+    /// scheme actions, then materialize CreateFraudulentEntry actions as new JEs and labels.
+    fn run_multi_stage_schemes(
+        &self,
+        entries: &[JournalEntry],
+        injector: &mut AnomalyInjector,
+    ) -> SynthResult<(Vec<JournalEntry>, Vec<LabeledAnomaly>)> {
+        use datasynth_core::models::{AccountSubType, AnomalyType, FraudType, LabeledAnomaly};
+
+        let coa = match self.coa.as_ref() {
+            Some(c) => c,
+            None => return Ok((Vec::new(), Vec::new())),
+        };
+
+        let start_date = entries
+            .iter()
+            .map(|e| e.header.posting_date)
+            .min()
+            .or_else(|| {
+                self.config
+                    .global
+                    .start_date
+                    .parse::<chrono::NaiveDate>()
+                    .ok()
+            })
+            .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        let end_date = entries
+            .iter()
+            .map(|e| e.header.posting_date)
+            .max()
+            .unwrap_or(start_date);
+
+        let companies: Vec<String> = self
+            .config
+            .companies
+            .iter()
+            .map(|c| c.code.clone())
+            .collect();
+        if companies.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let accounts: Vec<String> = coa
+            .get_postable_accounts()
+            .iter()
+            .map(|a| a.account_number.clone())
+            .take(200)
+            .collect();
+        let cash_accounts: Vec<String> = coa
+            .get_accounts_by_sub_type(AccountSubType::Cash)
+            .iter()
+            .map(|a| a.account_number.clone())
+            .collect();
+        let cash_account = cash_accounts
+            .first()
+            .cloned()
+            .or_else(|| accounts.first().cloned())
+            .unwrap_or_else(|| "1000".to_string());
+        let expense_or_asset = accounts
+            .iter()
+            .find(|a| a.starts_with('6') || a.starts_with('1'))
+            .cloned()
+            .unwrap_or_else(|| accounts.first().cloned().unwrap_or_else(|| "6000".to_string()));
+
+        let vendor_ids: Vec<String> = self
+            .master_data
+            .vendors
+            .iter()
+            .map(|v| v.vendor_id.clone())
+            .take(500)
+            .collect();
+        let user_ids: Vec<String> = self
+            .master_data
+            .employees
+            .iter()
+            .map(|e| e.employee_id.clone())
+            .take(500)
+            .collect();
+
+        let mut scheme_entries = Vec::new();
+        let mut scheme_labels = Vec::new();
+
+        let mut current = start_date;
+        while current <= end_date {
+            for company_code in &companies {
+                let context = SchemeContext::new(current, company_code.clone())
+                    .with_accounts(accounts.clone())
+                    .with_counterparties(vendor_ids.clone())
+                    .with_users(user_ids.clone());
+                injector.maybe_start_scheme(
+                    current,
+                    company_code,
+                    user_ids.clone(),
+                    accounts.clone(),
+                    vendor_ids.clone(),
+                );
+                let actions = injector.advance_schemes_with_context(&context);
+                for action in actions {
+                    if action.action_type != SchemeActionType::CreateFraudulentEntry {
+                        continue;
+                    }
+                    let amount = action
+                        .amount
+                        .unwrap_or_else(|| rust_decimal::Decimal::from(100));
+                    let debit_account = action
+                        .target_account
+                        .clone()
+                        .unwrap_or_else(|| expense_or_asset.clone());
+                    let doc_id = uuid::Uuid::now_v7();
+                    let mut header = JournalEntryHeader::with_deterministic_id(
+                        company_code.clone(),
+                        action.target_date,
+                        doc_id,
+                    );
+                    header.created_by = action
+                        .user_id
+                        .clone()
+                        .unwrap_or_else(|| "SYSTEM".to_string());
+                    header.header_text = Some(action.description.clone());
+                    header.is_fraud = true;
+                    header.anomaly_id = Some(action.action_id.to_string());
+                    let mut entry = JournalEntry::new(header);
+                    entry.add_line(JournalEntryLine::debit(
+                        doc_id,
+                        1,
+                        debit_account,
+                        amount,
+                    ));
+                    entry.add_line(JournalEntryLine::credit(doc_id, 2, cash_account.clone(), amount));
+                    scheme_entries.push(entry);
+                    let mut label = LabeledAnomaly::new(
+                        action.action_id.to_string(),
+                        AnomalyType::Fraud(FraudType::FictitiousTransaction),
+                        doc_id.to_string(),
+                        "JE".to_string(),
+                        company_code.clone(),
+                        action.target_date,
+                    );
+                    label.scenario_id = Some(action.scheme_id.to_string());
+                    label.metadata
+                        .insert("scheme_action".to_string(), "CreateFraudulentEntry".to_string());
+                    if let Some(amt) = action.amount {
+                        label.monetary_impact = Some(amt);
+                    }
+                    scheme_labels.push(label);
+                }
+            }
+            if let Some(next) = current.succ_opt() {
+                current = next;
+            } else {
+                break;
+            }
+        }
+
+        Ok((scheme_entries, scheme_labels))
+    }
+
     /// Inject anomalies into journal entries.
-    fn inject_anomalies(&mut self, entries: &mut [JournalEntry]) -> SynthResult<AnomalyLabels> {
+    fn inject_anomalies(&mut self, entries: &mut Vec<JournalEntry>) -> SynthResult<AnomalyLabels> {
         let pb = self.create_progress_bar(entries.len() as u64, "Injecting Anomalies");
 
         // Read anomaly rates from config instead of using hardcoded values.
@@ -6303,6 +6582,14 @@ impl EnhancedOrchestrator {
             AnomalyRateConfig::default().process_issue_rate
         };
 
+        // Wire enhanced anomaly config (multi-stage schemes, etc.) from YAML so they are actually used
+        let ai = &self.config.anomaly_injection;
+        let mut enhanced = datasynth_generators::EnhancedInjectionConfig::default();
+        enhanced.multi_stage_schemes_enabled = ai.multi_stage_schemes.enabled;
+        if ai.multi_stage_schemes.enabled {
+            enhanced.scheme_probability = ai.multi_stage_schemes.embezzlement.probability;
+        }
+
         let anomaly_config = AnomalyInjectorConfig {
             rates: AnomalyRateConfig {
                 total_rate,
@@ -6312,10 +6599,33 @@ impl EnhancedOrchestrator {
                 ..Default::default()
             },
             seed: self.seed + 5000,
+            enhanced,
             ..Default::default()
         };
 
         let mut injector = AnomalyInjector::new(anomaly_config);
+
+        // Run multi-stage schemes so they produce actions and new JEs (CreateFraudulentEntry)
+        let mut scheme_labels = Vec::new();
+        if ai.multi_stage_schemes.enabled && !entries.is_empty() {
+            let (scheme_entries, labels_from_schemes) =
+                self.run_multi_stage_schemes(entries, &mut injector)?;
+            scheme_labels = labels_from_schemes;
+            if !scheme_entries.is_empty() {
+                info!(
+                    "Multi-stage schemes produced {} fraudulent JEs",
+                    scheme_entries.len()
+                );
+                entries.extend(scheme_entries);
+                entries.sort_by(|a, b| {
+                    a.header
+                        .posting_date
+                        .cmp(&b.header.posting_date)
+                        .then_with(|| a.header.document_id.cmp(&b.header.document_id))
+                });
+            }
+        }
+
         let result = injector.process_entries(entries);
 
         if let Some(pb) = &pb {
@@ -6323,15 +6633,18 @@ impl EnhancedOrchestrator {
             pb.finish_with_message("Anomaly injection complete");
         }
 
+        let mut labels = result.labels;
+        labels.extend(scheme_labels);
+
         let mut by_type = HashMap::new();
-        for label in &result.labels {
+        for label in &labels {
             *by_type
                 .entry(format!("{:?}", label.anomaly_type))
                 .or_insert(0) += 1;
         }
 
         Ok(AnomalyLabels {
-            labels: result.labels,
+            labels,
             summary: Some(result.summary),
             by_type,
         })
