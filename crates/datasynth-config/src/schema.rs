@@ -185,6 +185,23 @@ pub struct GeneratorConfig {
     pub country_packs: Option<CountryPacksSchemaConfig>,
 }
 
+impl GeneratorConfig {
+    /// Target total journal entry count for the configured period (sum over companies of
+    /// annual_volume * volume_weight * period_months/12). Used to derive document flow chain
+    /// counts when `document_flows.entry_share` is set.
+    pub fn target_entry_count(&self) -> u64 {
+        let months = self.global.period_months as f64;
+        self.companies
+            .iter()
+            .map(|c| {
+                let annual = c.annual_transaction_volume.count() as f64;
+                let weighted = annual * c.volume_weight;
+                (weighted * months / 12.0).round() as u64
+            })
+            .sum()
+    }
+}
+
 /// LLM enrichment configuration.
 ///
 /// Controls AI-augmented metadata enrichment using LLM providers.
@@ -2626,6 +2643,26 @@ impl Default for CostCenterMasterConfig {
 /// Document flow generation configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentFlowConfig {
+    /// Share of target total entries that should come from document-flow JEs (P2P + O2C).
+    /// E.g. 0.10 = 10%: with hundred_k (100K entries) that is 10K process entries;
+    /// with entries_per_chain_avg 4 that yields 2_500 chains total, split by p2p_share.
+    /// When set, p2p_chains/o2c_chains are derived; when unset, use p2p_chains/o2c_chains if set.
+    #[serde(default)]
+    pub entry_share: Option<f64>,
+    /// Average journal entries per document chain (P2P or O2C). Used with entry_share to
+    /// compute chain counts. Default when entry_share is set: 4.
+    #[serde(default)]
+    pub entries_per_chain_avg: Option<f64>,
+    /// Fraction of document-flow chains that are P2P (rest are O2C). 0.5 = 50% P2P, 50% O2C.
+    /// Only used when entry_share is set. Default: 0.5.
+    #[serde(default)]
+    pub p2p_share: Option<f64>,
+    /// Explicit number of P2P chains (used when entry_share is unset). Runtime caps at vendors*2.
+    #[serde(default)]
+    pub p2p_chains: Option<usize>,
+    /// Explicit number of O2C chains (used when entry_share is unset). Runtime caps at customers*2.
+    #[serde(default)]
+    pub o2c_chains: Option<usize>,
     /// P2P (Procure-to-Pay) flow configuration
     #[serde(default)]
     pub p2p: P2PFlowConfig,
@@ -2643,10 +2680,36 @@ pub struct DocumentFlowConfig {
 impl Default for DocumentFlowConfig {
     fn default() -> Self {
         Self {
+            entry_share: None,
+            entries_per_chain_avg: None,
+            p2p_share: None,
+            p2p_chains: None,
+            o2c_chains: None,
             p2p: P2PFlowConfig::default(),
             o2c: O2CFlowConfig::default(),
             generate_document_references: true,
             export_flow_graph: false,
+        }
+    }
+}
+
+impl DocumentFlowConfig {
+    /// Resolve (p2p_chains, o2c_chains) from either entry_share or explicit counts.
+    /// `target_entry_count` is the config target total entries (e.g. from `GeneratorConfig::target_entry_count()`).
+    pub fn resolve_chain_counts(&self, target_entry_count: u64) -> (usize, usize) {
+        if let Some(share) = self.entry_share {
+            let share = share.clamp(0.0, 1.0);
+            let process_entries = (target_entry_count as f64 * share).round() as u64;
+            let entries_per_chain = self.entries_per_chain_avg.unwrap_or(4.0).max(1.0);
+            let total_chains = (process_entries as f64 / entries_per_chain).round() as usize;
+            let p2p_share = self.p2p_share.unwrap_or(0.5).clamp(0.0, 1.0);
+            let p2p = (total_chains as f64 * p2p_share).round() as usize;
+            let o2c = total_chains.saturating_sub(p2p);
+            (p2p, o2c)
+        } else {
+            let p2p = self.p2p_chains.unwrap_or(50);
+            let o2c = self.o2c_chains.unwrap_or(50);
+            (p2p, o2c)
         }
     }
 }

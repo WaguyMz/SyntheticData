@@ -282,6 +282,21 @@ fn validate_master_data(config: &GeneratorConfig) -> SynthResult<()> {
 
 /// Validate document flow configuration.
 fn validate_document_flows(config: &GeneratorConfig) -> SynthResult<()> {
+    let df = &config.document_flows;
+    if let Some(s) = df.entry_share {
+        validate_rate("document_flows.entry_share", s)?;
+    }
+    if let Some(avg) = df.entries_per_chain_avg {
+        if avg < 0.5 || avg > 100.0 {
+            return Err(SynthError::validation(
+                "document_flows.entries_per_chain_avg must be between 0.5 and 100",
+            ));
+        }
+    }
+    if let Some(s) = df.p2p_share {
+        validate_rate("document_flows.p2p_share", s)?;
+    }
+
     // P2P config
     let p2p = &config.document_flows.p2p;
     if p2p.enabled {

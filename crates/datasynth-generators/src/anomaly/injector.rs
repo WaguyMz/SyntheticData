@@ -70,8 +70,14 @@ pub struct AnomalyInjectorConfig {
 pub struct EnhancedInjectionConfig {
     /// Enable multi-stage fraud scheme generation.
     pub multi_stage_schemes_enabled: bool,
-    /// Probability of starting a new scheme per perpetrator per year.
+    /// Probability of starting a new scheme (legacy single value; used as fallback if per-type not set).
     pub scheme_probability: f64,
+    /// Embezzlement scheme start probability (from config; overrides scheme_probability when set).
+    pub embezzlement_probability: f64,
+    /// Revenue manipulation scheme start probability (from config).
+    pub revenue_manipulation_probability: f64,
+    /// Kickback scheme start probability (from config).
+    pub kickback_probability: f64,
     /// Enable correlated anomaly injection.
     pub correlated_injection_enabled: bool,
     /// Enable temporal clustering (period-end spikes).
@@ -214,10 +220,23 @@ impl AnomalyInjector {
 
         // Initialize enhanced components based on configuration
         let scheme_advancer = if config.enhanced.multi_stage_schemes_enabled {
+            let e = &config.enhanced;
             let scheme_config = SchemeAdvancerConfig {
-                embezzlement_probability: config.enhanced.scheme_probability,
-                revenue_manipulation_probability: config.enhanced.scheme_probability * 0.5,
-                kickback_probability: config.enhanced.scheme_probability * 0.5,
+                embezzlement_probability: if e.embezzlement_probability > 0.0 {
+                    e.embezzlement_probability
+                } else {
+                    e.scheme_probability
+                },
+                revenue_manipulation_probability: if e.revenue_manipulation_probability > 0.0 {
+                    e.revenue_manipulation_probability
+                } else {
+                    e.scheme_probability * 0.5
+                },
+                kickback_probability: if e.kickback_probability > 0.0 {
+                    e.kickback_probability
+                } else {
+                    e.scheme_probability * 0.5
+                },
                 seed: rng.gen(),
                 ..Default::default()
             };

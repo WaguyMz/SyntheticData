@@ -535,9 +535,15 @@ fn main() -> Result<()> {
                         // Wire up anomaly and data quality injection from config
                         inject_anomalies: cfg.fraud.enabled || cfg.anomaly_injection.enabled,
                         inject_data_quality: cfg.data_quality.enabled,
-                        // Use conservative defaults for document generation
-                        p2p_chains: 50,
-                        o2c_chains: 50,
+                        // Document flow chain counts: from entry_share % of target entries, or explicit p2p_chains/o2c_chains
+                        p2p_chains: {
+                            let (p2p, _o2c) = cfg.document_flows.resolve_chain_counts(cfg.target_entry_count());
+                            p2p
+                        },
+                        o2c_chains: {
+                            let (_p2p, o2c) = cfg.document_flows.resolve_chain_counts(cfg.target_entry_count());
+                            o2c
+                        },
                         vendors_per_company: 20,
                         customers_per_company: 30,
                         materials_per_company: 50,

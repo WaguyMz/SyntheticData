@@ -1797,6 +1797,18 @@ impl EnhancedOrchestrator {
             Vec::new()
         };
 
+        // Set each journal entry's currency from company config (so FEC/FR and exports show EUR when config specifies EUR)
+        for entry in entries.iter_mut() {
+            if let Some(company) = self
+                .config
+                .companies
+                .iter()
+                .find(|c| c.code == entry.header.company_code)
+            {
+                entry.header.currency = company.currency.clone();
+            }
+        }
+
         Ok(EnhancedGenerationResult {
             chart_of_accounts: (*coa).clone(),
             master_data: self.master_data.clone(),
@@ -2079,6 +2091,16 @@ impl EnhancedOrchestrator {
         actions: &DegradationActions,
         stats: &mut EnhancedGenerationStatistics,
     ) -> SynthResult<AnomalyLabels> {
+        // Diagnostic: always log Phase 5 gate so we can see why injection is skipped when no log appears.
+        let multi_stage_enabled = self.config.anomaly_injection.multi_stage_schemes.enabled;
+        info!(
+            "Phase 5 gate: inject_anomalies={}, entries_empty={}, skip_anomaly_injection={}, config.multi_stage_schemes.enabled={}",
+            self.phase_config.inject_anomalies,
+            entries.is_empty(),
+            actions.skip_anomaly_injection,
+            multi_stage_enabled
+        );
+        info!("MULTI_STAGE_CONFIG multi_stage_schemes.enabled={}", multi_stage_enabled);
         if self.phase_config.inject_anomalies
             && !entries.is_empty()
             && !actions.skip_anomaly_injection
@@ -6472,6 +6494,19 @@ impl EnhancedOrchestrator {
             .take(500)
             .collect();
 
+        if user_ids.is_empty() {
+            debug!(
+                "Multi-stage schemes: no employees in master_data; no schemes can start (need perpetrators)"
+            );
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if accounts.is_empty() {
+            debug!(
+                "Multi-stage schemes: no postable accounts in CoA; skipping scheme generation"
+            );
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         let mut scheme_entries = Vec::new();
         let mut scheme_labels = Vec::new();
 
@@ -6588,6 +6623,10 @@ impl EnhancedOrchestrator {
         enhanced.multi_stage_schemes_enabled = ai.multi_stage_schemes.enabled;
         if ai.multi_stage_schemes.enabled {
             enhanced.scheme_probability = ai.multi_stage_schemes.embezzlement.probability;
+            enhanced.embezzlement_probability = ai.multi_stage_schemes.embezzlement.probability;
+            enhanced.revenue_manipulation_probability =
+                ai.multi_stage_schemes.revenue_manipulation.probability;
+            enhanced.kickback_probability = ai.multi_stage_schemes.kickback.probability;
         }
 
         let anomaly_config = AnomalyInjectorConfig {
@@ -6605,7 +6644,18 @@ impl EnhancedOrchestrator {
 
         let mut injector = AnomalyInjector::new(anomaly_config);
 
-        // Run multi-stage schemes so they produce actions and new JEs (CreateFraudulentEntry)
+        // Diagnostic: always log so we can see why multi-stage block may be skipped (no log at all otherwise).
+        info!(
+            "Anomaly injection config: anomaly_injection.enabled={}, multi_stage_schemes.enabled={}, entries_count={}",
+            ai.enabled,
+            ai.multi_stage_schemes.enabled,
+            entries.len()
+        );
+        info!("MULTI_STAGE_CONFIG multi_stage_schemes.enabled={} (in inject_anomalies)", ai.multi_stage_schemes.enabled);
+
+        // Run multi-stage schemes so they produce actions and new JEs.
+        // Only CreateFraudulentEntry actions are materialized as JEs (embezzlement); revenue/kickback
+        // produce other action types (InflateInvoice, etc.) which are not yet materialized.
         let mut scheme_labels = Vec::new();
         if ai.multi_stage_schemes.enabled && !entries.is_empty() {
             let (scheme_entries, labels_from_schemes) =
@@ -6613,7 +6663,7 @@ impl EnhancedOrchestrator {
             scheme_labels = labels_from_schemes;
             if !scheme_entries.is_empty() {
                 info!(
-                    "Multi-stage schemes produced {} fraudulent JEs",
+                    "Multi-stage schemes produced {} fraudulent JEs (CreateFraudulentEntry from embezzlement)",
                     scheme_entries.len()
                 );
                 entries.extend(scheme_entries);
@@ -6623,6 +6673,18 @@ impl EnhancedOrchestrator {
                         .cmp(&b.header.posting_date)
                         .then_with(|| a.header.document_id.cmp(&b.header.document_id))
                 });
+            } else {
+                let total_actions = injector.get_scheme_actions().len();
+                if total_actions > 0 {
+                    info!(
+                        "Multi-stage schemes produced {} scheme actions but none were CreateFraudulentEntry (only those are materialized as JEs; revenue/kickback use other action types)",
+                        total_actions
+                    );
+                } else {
+                    debug!(
+                        "Multi-stage schemes: no scheme actions generated (ensure master_data.employees and vendors are populated; start probability is per day)"
+                    );
+                }
             }
         }
 

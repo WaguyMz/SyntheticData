@@ -78,7 +78,8 @@ pub mod tax_accounts {
 
 /// Cash and bank – Class 5
 pub mod cash_accounts {
-    pub const OPERATING_CASH: &str = "530000";
+    /// note: Operating Cash is not official in PCG, it only consider's either petty cash or bank account.
+    pub const OPERATING_CASH: &str = "512000";
     pub const BANK_ACCOUNT: &str = "512000";
     pub const PETTY_CASH: &str = "531000";
 }
