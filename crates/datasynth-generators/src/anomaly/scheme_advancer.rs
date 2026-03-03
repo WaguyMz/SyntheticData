@@ -5,17 +5,41 @@
 
 use chrono::NaiveDate;
 use datasynth_core::utils::seeded_rng;
+use datasynth_core::uuid_factory::{DeterministicUuidFactory, GeneratorType};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use std::collections::HashMap;
 
 use datasynth_core::models::{SchemeDetectionStatus, SchemeType};
 
+/// Returns (pathology_name, pathology_category) for RIP-GNN taxonomy.
+fn pathology_taxonomy(scheme_type: SchemeType) -> (&'static str, &'static str) {
+    use SchemeType::*;
+    match scheme_type {
+        GradualEmbezzlement => ("GradualEmbezzlement", "Sequential"),
+        RevenueManipulation => ("RevenueManipulation", "Volume"),
+        VendorKickback => ("VendorKickback", "Relational"),
+        TriadBypass => ("TriadBypass", "Relational"),
+        ShadowPayroll => ("ShadowPayroll", "Sequential"),
+        ExpenseLaundering => ("ExpenseLaundering", "Volume"),
+        Smurfing => ("Smurfing", "Volume"),
+        CircularFunding => ("CircularFunding", "Relational"),
+        PhantomWarehousing => ("PhantomWarehousing", "Relational"),
+        IntercompanyWashTrades => ("IntercompanyWashTrades", "Relational"),
+        RoundTripping | GhostEmployee | ExpenseReimbursement | InventoryTheft | Custom => {
+            (scheme_type.name(), "Relational")
+        }
+    }
+}
+
 use super::schemes::{
-    FraudScheme, GradualEmbezzlementScheme, RevenueManipulationScheme, SchemeAction, SchemeContext,
-    SchemeStatus, VendorKickbackScheme,
+    ExpenseLaunderingScheme, FraudScheme, GradualEmbezzlementScheme, RevenueManipulationScheme,
+    SchemeAction, SchemeContext, ShadowPayrollScheme, SchemeStatus, SmurfingScheme,
+    TriadBypassScheme, VendorKickbackScheme,
 };
 
 /// Configuration for scheme generation.
@@ -27,7 +51,26 @@ pub struct SchemeAdvancerConfig {
     pub revenue_manipulation_probability: f64,
     /// Probability of starting a kickback scheme per period.
     pub kickback_probability: f64,
-    /// Maximum number of concurrent schemes.
+    /// Kickback commission as fraction of vendor usual amount (suggests fraud).
+    pub kickback_amount_shift_percent: f64,
+    /// Vendor typical order amount range when no prior inflated base is recorded.
+    pub kickback_vendor_typical_amount_min: f64,
+    pub kickback_vendor_typical_amount_max: f64,
+    /// Probability of starting a triad bypass scheme per period.
+    pub triad_bypass_probability: f64,
+    /// Probability of starting a shadow payroll scheme per period.
+    pub shadow_payroll_probability: f64,
+    /// Probability of starting an expense laundering scheme per period.
+    pub expense_laundering_probability: f64,
+    /// Probability of starting a smurfing scheme per period.
+    pub smurfing_probability: f64,
+    /// Probability of starting a circular funding scheme per period.
+    pub circular_funding_probability: f64,
+    /// Probability of starting a phantom warehousing scheme per period.
+    pub phantom_warehousing_probability: f64,
+    /// Probability of starting an intercompany wash trade scheme per period.
+    pub intercompany_wash_trade_probability: f64,
+    /// Maximum number of concurrent schemes **per scheme type**.
     pub max_concurrent_schemes: usize,
     /// Whether to allow the same perpetrator in multiple schemes.
     pub allow_repeat_perpetrators: bool,
@@ -41,7 +84,17 @@ impl Default for SchemeAdvancerConfig {
             embezzlement_probability: 0.02,
             revenue_manipulation_probability: 0.01,
             kickback_probability: 0.01,
-            max_concurrent_schemes: 5,
+            kickback_amount_shift_percent: 0.15,
+            kickback_vendor_typical_amount_min: 5_000.0,
+            kickback_vendor_typical_amount_max: 50_000.0,
+            triad_bypass_probability: 0.005,
+            shadow_payroll_probability: 0.005,
+            expense_laundering_probability: 0.005,
+            smurfing_probability: 0.005,
+            circular_funding_probability: 0.005,
+            phantom_warehousing_probability: 0.005,
+            intercompany_wash_trade_probability: 0.005,
+            max_concurrent_schemes: 10      ,
             allow_repeat_perpetrators: false,
             seed: 42,
         }
@@ -78,8 +131,10 @@ pub struct CompletedScheme {
 pub struct MultiStageAnomalyLabel {
     /// Anomaly ID.
     pub anomaly_id: String,
-    /// Scheme ID.
+    /// Scheme ID (scenario id).
     pub scheme_id: Uuid,
+    /// Action ID (one per SchemeAction).
+    pub action_id: Uuid,
     /// Scheme type.
     pub scheme_type: SchemeType,
     /// Stage number within scheme.
@@ -92,16 +147,39 @@ pub struct MultiStageAnomalyLabel {
     pub perpetrator_id: String,
     /// Whether scheme was ultimately detected.
     pub scheme_detected: bool,
+    /// Pathology name for RIP-GNN taxonomy (e.g. "Smurfing", "CircularFunding").
+    #[serde(default)]
+    pub pathology_name: String,
+    /// Pathology category: "Sequential", "Volume", or "Relational".
+    #[serde(default)]
+    pub pathology_category: String,
+    /// Date of the action (from SchemeAction.target_date).
+    #[serde(default)]
+    pub anomaly_date: Option<NaiveDate>,
+    /// Involved counterparty (vendor/customer ID) if applicable.
+    #[serde(default)]
+    pub counterparty: Option<String>,
+    /// Action amount if applicable (for display in viewer).
+    #[serde(default)]
+    pub action_amount: Option<rust_decimal::Decimal>,
 }
 
 /// Manages the lifecycle of multiple fraud schemes.
 pub struct SchemeAdvancer {
     config: SchemeAdvancerConfig,
     rng: ChaCha8Rng,
+    /// Deterministic UUID factory for unique scheme ids.
+    scheme_uuid_factory: DeterministicUuidFactory,
+    /// Per-scheme RNG state. Keeping state (instead of re-seeding every day)
+    /// ensures schemes have realistic variation over time while remaining deterministic.
+    scheme_rngs: HashMap<Uuid, ChaCha8Rng>,
     /// Active schemes.
     active_schemes: Vec<Box<dyn FraudScheme>>,
     /// Completed schemes.
     completed_schemes: Vec<CompletedScheme>,
+    /// Indices of schemes that finished in advance_all but are not removed until
+    /// after the caller records labels (so record_label can still find them).
+    pending_removal: Vec<usize>,
     /// Users who are currently perpetrators.
     active_perpetrators: Vec<String>,
     /// Vendors involved in active schemes.
@@ -114,26 +192,28 @@ impl SchemeAdvancer {
     /// Creates a new scheme advancer.
     pub fn new(config: SchemeAdvancerConfig) -> Self {
         let rng = seeded_rng(config.seed, 0);
+        let scheme_uuid_factory = DeterministicUuidFactory::new(config.seed, GeneratorType::Anomaly);
         Self {
             config,
             rng,
+            scheme_uuid_factory,
+            scheme_rngs: HashMap::new(),
             active_schemes: Vec::new(),
             completed_schemes: Vec::new(),
+            pending_removal: Vec::new(),
             active_perpetrators: Vec::new(),
             active_vendors: Vec::new(),
             labels: Vec::new(),
         }
     }
 
-    /// Potentially starts a new scheme based on probabilities.
-    pub fn maybe_start_scheme(&mut self, context: &SchemeContext) -> Option<Uuid> {
-        // Check if we can add more schemes
-        if self.active_schemes.len() >= self.config.max_concurrent_schemes {
-            return None;
-        }
-
-        // Check available perpetrators
-        let available_users: Vec<_> = if self.config.allow_repeat_perpetrators {
+    /// Potentially starts new scheme(s) based on **independent** per-scheme probabilities.
+    ///
+    /// Each scheme type is evaluated with its own Bernoulli draw (so probabilities do NOT need
+    /// to sum to 1.0). If multiple scheme types fire in the same period, we start as many as
+    /// allowed by the per-type `max_concurrent_schemes` limit and available perpetrators/vendors.
+    pub fn maybe_start_schemes(&mut self, context: &SchemeContext) -> Vec<Uuid> {
+        let mut available_users: Vec<String> = if self.config.allow_repeat_perpetrators {
             context.available_users.clone()
         } else {
             context
@@ -145,69 +225,130 @@ impl SchemeAdvancer {
         };
 
         if available_users.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        // Determine which scheme type to start (if any)
-        let r = self.rng.random::<f64>();
-        let total_prob = self.config.embezzlement_probability
-            + self.config.revenue_manipulation_probability
-            + self.config.kickback_probability;
-
-        if r > total_prob {
-            return None;
-        }
-
-        let normalized_r = r / total_prob;
-        let embezzlement_threshold = self.config.embezzlement_probability / total_prob;
-        let revenue_threshold =
-            embezzlement_threshold + self.config.revenue_manipulation_probability / total_prob;
-
-        let user_idx = self.rng.random_range(0..available_users.len());
-        let perpetrator = available_users[user_idx].clone();
-
-        let scheme: Box<dyn FraudScheme> = if normalized_r < embezzlement_threshold {
-            // Start embezzlement scheme
-            let scheme = GradualEmbezzlementScheme::new(&perpetrator)
-                .with_accounts(context.available_accounts.clone());
-            Box::new(scheme)
-        } else if normalized_r < revenue_threshold {
-            // Start revenue manipulation scheme
-            let scheme = RevenueManipulationScheme::new(&perpetrator);
-            Box::new(scheme)
-        } else {
-            // Start kickback scheme - need a vendor
-            if context.available_counterparties.is_empty() {
-                return None;
+        // Independent Bernoulli draws per scheme type.
+        // Clamp to [0,1] to keep "probability" semantics even if configs exceed 1.0.
+        let mut fired: Vec<SchemeType> = Vec::new();
+        let mut draw = |t: SchemeType, p: f64| {
+            if p > 0.0 && self.rng.random::<f64>() < p.clamp(0.0, 1.0) {
+                fired.push(t);
             }
-
-            let available_vendors: Vec<_> = context
-                .available_counterparties
-                .iter()
-                .filter(|v| !self.active_vendors.contains(v))
-                .cloned()
-                .collect();
-
-            if available_vendors.is_empty() {
-                return None;
-            }
-
-            let vendor_idx = self.rng.random_range(0..available_vendors.len());
-            let vendor = available_vendors[vendor_idx].clone();
-
-            let inflation = 0.10 + self.rng.random::<f64>() * 0.15; // 10-25%
-            let scheme =
-                VendorKickbackScheme::new(&perpetrator, &vendor).with_inflation_percent(inflation);
-
-            self.active_vendors.push(vendor);
-            Box::new(scheme)
         };
+        draw(SchemeType::GradualEmbezzlement, self.config.embezzlement_probability);
+        draw(
+            SchemeType::RevenueManipulation,
+            self.config.revenue_manipulation_probability,
+        );
+        draw(SchemeType::VendorKickback, self.config.kickback_probability);
+        draw(SchemeType::TriadBypass, self.config.triad_bypass_probability);
+        draw(SchemeType::ShadowPayroll, self.config.shadow_payroll_probability);
+        draw(
+            SchemeType::ExpenseLaundering,
+            self.config.expense_laundering_probability,
+        );
+        draw(SchemeType::Smurfing, self.config.smurfing_probability);
+        // Circular Funding, Phantom Warehousing, Intercompany Wash Trades are disabled
+        // (Single-FEC scope: no multi-entity cyclical patterns).
 
-        let scheme_id = scheme.scheme_id();
-        self.active_perpetrators.push(perpetrator);
-        self.active_schemes.push(scheme);
+        if fired.is_empty() {
+            return Vec::new();
+        }
 
-        Some(scheme_id)
+        // Avoid deterministic bias if many schemes fire in the same period.
+        fired.shuffle(&mut self.rng);
+
+        let mut started: Vec<Uuid> = Vec::new();
+        for scheme_type in fired {
+            // Enforce a per-type **concurrency** cap only: at most
+            // `max_concurrent_schemes` active instances of a given
+            // scheme type at the same time. Completed schemes do not
+            // count toward this limit, so a type can appear again in
+            // a later period once earlier instances have finished.
+            let active_of_type = self
+                .active_schemes
+                .iter()
+                .filter(|s| s.scheme_type() == scheme_type)
+                .count();
+            if active_of_type >= self.config.max_concurrent_schemes {
+                continue;
+            }
+            if available_users.is_empty() {
+                break;
+            }
+
+            // Vendor kickback requires a vendor not already "active" in another kickback scheme.
+            let vendor_for_kickback: Option<String> = if scheme_type == SchemeType::VendorKickback {
+                let available_vendors: Vec<_> = context
+                    .available_counterparties
+                    .iter()
+                    .filter(|v| !self.active_vendors.contains(v))
+                    .cloned()
+                    .collect();
+                if available_vendors.is_empty() {
+                    continue;
+                }
+                let vendor_idx = self.rng.random_range(0..available_vendors.len());
+                Some(available_vendors[vendor_idx].clone())
+            } else {
+                None
+            };
+
+            let user_idx = self.rng.random_range(0..available_users.len());
+            let perpetrator = if self.config.allow_repeat_perpetrators {
+                available_users[user_idx].clone()
+            } else {
+                available_users.swap_remove(user_idx)
+            };
+
+            let scheme_id = self.scheme_uuid_factory.next();
+            let scheme: Box<dyn FraudScheme> = match scheme_type {
+                SchemeType::GradualEmbezzlement => {
+                    let s = GradualEmbezzlementScheme::new(scheme_id, &perpetrator)
+                        .with_accounts(context.available_accounts.clone());
+                    Box::new(s)
+                }
+                SchemeType::RevenueManipulation => Box::new(RevenueManipulationScheme::new(scheme_id, &perpetrator)),
+                SchemeType::VendorKickback => {
+                    let vendor = vendor_for_kickback.expect("vendor should be set for VendorKickback");
+                    let inflation = 0.10 + self.rng.random::<f64>() * 0.15;
+                    let s = VendorKickbackScheme::new(scheme_id, &perpetrator, &vendor)
+                        .with_inflation_percent(inflation)
+                        .with_amount_shift_percent(self.config.kickback_amount_shift_percent)
+                        .with_vendor_typical_range(
+                            self.config.kickback_vendor_typical_amount_min,
+                            self.config.kickback_vendor_typical_amount_max,
+                        );
+                    self.active_vendors.push(vendor);
+                    Box::new(s)
+                }
+                SchemeType::TriadBypass => Box::new(TriadBypassScheme::new(scheme_id, &perpetrator)),
+                SchemeType::ShadowPayroll => Box::new(ShadowPayrollScheme::new(scheme_id, &perpetrator)),
+                SchemeType::ExpenseLaundering => Box::new(ExpenseLaunderingScheme::new(scheme_id, &perpetrator)),
+                SchemeType::Smurfing => Box::new(SmurfingScheme::new(scheme_id, &perpetrator)),
+                // Disabled: Circular Funding, Phantom Warehousing, Intercompany Wash Trades.
+                SchemeType::CircularFunding
+                | SchemeType::PhantomWarehousing
+                | SchemeType::IntercompanyWashTrades => continue,
+                // These are currently not wired in the config-driven advancer list.
+                _ => continue,
+            };
+
+            self.scheme_rngs
+                .entry(scheme_id)
+                .or_insert_with(|| seeded_rng(self.config.seed, scheme_id.as_u128() as u64));
+            self.active_perpetrators.push(perpetrator);
+            self.active_schemes.push(scheme);
+            started.push(scheme_id);
+        }
+
+        started
+    }
+
+    /// Backwards-compatible wrapper: starts independent schemes and returns the first started id.
+    pub fn maybe_start_scheme(&mut self, context: &SchemeContext) -> Option<Uuid> {
+        self.maybe_start_schemes(context).into_iter().next()
     }
 
     /// Advances all active schemes and returns actions to execute.
@@ -216,10 +357,12 @@ impl SchemeAdvancer {
         let mut schemes_to_complete = Vec::new();
 
         for (idx, scheme) in self.active_schemes.iter_mut().enumerate() {
-            // Create a local RNG for each scheme to ensure determinism
-            let mut scheme_rng = seeded_rng(self.config.seed, scheme.scheme_id().as_u128() as u64);
-
-            let actions = scheme.advance(context, &mut scheme_rng);
+            let scheme_id = scheme.scheme_id();
+            let scheme_rng = self
+                .scheme_rngs
+                .entry(scheme_id)
+                .or_insert_with(|| seeded_rng(self.config.seed, scheme_id.as_u128() as u64));
+            let actions = scheme.advance(context, scheme_rng);
             all_actions.extend(actions);
 
             // Check if scheme is done
@@ -231,8 +374,17 @@ impl SchemeAdvancer {
             }
         }
 
-        // Complete finished schemes (iterate in reverse to maintain indices)
-        for idx in schemes_to_complete.into_iter().rev() {
+        // Defer removal so the caller can record_label for these actions while
+        // the scheme is still in active_schemes. Call flush_completed_schemes after recording.
+        self.pending_removal = schemes_to_complete;
+
+        all_actions
+    }
+
+    /// Removes schemes that completed in the last advance_all. Call this after
+    /// recording labels for the returned actions so record_label can find the scheme.
+    pub fn flush_completed_schemes(&mut self, context: &SchemeContext) {
+        for idx in self.pending_removal.drain(..).rev() {
             let scheme = self.active_schemes.remove(idx);
             let completed = CompletedScheme {
                 scheme_id: scheme.scheme_id(),
@@ -246,15 +398,10 @@ impl SchemeAdvancer {
                 stages_completed: scheme.current_stage_number(),
                 transaction_count: scheme.transaction_refs().len(),
             };
-
-            // Remove perpetrator from active list
             self.active_perpetrators
                 .retain(|p| p != scheme.perpetrator_id());
-
             self.completed_schemes.push(completed);
         }
-
-        all_actions
     }
 
     /// Records a label for a scheme action.
@@ -264,15 +411,23 @@ impl SchemeAdvancer {
             .iter()
             .find(|s| s.scheme_id() == action.scheme_id)
         {
+            let (pathology_name, pathology_category) =
+                pathology_taxonomy(scheme.scheme_type());
             let label = MultiStageAnomalyLabel {
                 anomaly_id: anomaly_id.into(),
                 scheme_id: scheme.scheme_id(),
+                action_id: action.action_id,
                 scheme_type: scheme.scheme_type(),
                 stage_number: action.stage,
                 stage_name: scheme.current_stage().name.clone(),
                 total_stages: scheme.stages().len() as u32,
                 perpetrator_id: scheme.perpetrator_id().to_string(),
                 scheme_detected: scheme.detection_status() != SchemeDetectionStatus::Undetected,
+                pathology_name: pathology_name.to_string(),
+                pathology_category: pathology_category.to_string(),
+                anomaly_date: Some(action.target_date),
+                counterparty: action.counterparty.clone(),
+                action_amount: action.amount,
             };
             self.labels.push(label);
         }
@@ -321,6 +476,8 @@ impl SchemeAdvancer {
         self.active_perpetrators.clear();
         self.active_vendors.clear();
         self.labels.clear();
+        self.scheme_rngs.clear();
+        self.scheme_uuid_factory = DeterministicUuidFactory::new(self.config.seed, GeneratorType::Anomaly);
         self.rng = seeded_rng(self.config.seed, 0);
     }
 
@@ -364,6 +521,13 @@ impl SchemeAdvancer {
             embezzlement_count: by_type(SchemeType::GradualEmbezzlement),
             revenue_manipulation_count: by_type(SchemeType::RevenueManipulation),
             kickback_count: by_type(SchemeType::VendorKickback),
+            triad_bypass_count: by_type(SchemeType::TriadBypass),
+            shadow_payroll_count: by_type(SchemeType::ShadowPayroll),
+            expense_laundering_count: by_type(SchemeType::ExpenseLaundering),
+            smurfing_count: by_type(SchemeType::Smurfing),
+            circular_funding_count: by_type(SchemeType::CircularFunding),
+            phantom_warehousing_count: by_type(SchemeType::PhantomWarehousing),
+            intercompany_wash_trade_count: by_type(SchemeType::IntercompanyWashTrades),
         }
     }
 }
@@ -387,6 +551,20 @@ pub struct SchemeStatistics {
     pub revenue_manipulation_count: usize,
     /// Number of kickback schemes.
     pub kickback_count: usize,
+    /// Number of triad bypass schemes.
+    pub triad_bypass_count: usize,
+    /// Number of shadow payroll schemes.
+    pub shadow_payroll_count: usize,
+    /// Number of expense laundering schemes.
+    pub expense_laundering_count: usize,
+    /// Number of smurfing schemes.
+    pub smurfing_count: usize,
+    /// Number of circular funding schemes.
+    pub circular_funding_count: usize,
+    /// Number of phantom warehousing schemes.
+    pub phantom_warehousing_count: usize,
+    /// Number of intercompany wash trade schemes.
+    pub intercompany_wash_trade_count: usize,
 }
 
 #[cfg(test)]

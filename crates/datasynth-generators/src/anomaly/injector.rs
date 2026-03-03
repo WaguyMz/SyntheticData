@@ -22,7 +22,7 @@ use tracing::debug;
 use datasynth_core::models::{
     AnomalyCausalReason, AnomalyDetectionDifficulty, AnomalyRateConfig, AnomalySummary,
     AnomalyType, ErrorType, FraudType, JournalEntry, LabeledAnomaly, NearMissLabel,
-    RelationalAnomalyType,
+    RelationalAnomalyType, SchemeType,
 };
 use datasynth_core::uuid_factory::{DeterministicUuidFactory, GeneratorType};
 
@@ -37,7 +37,7 @@ use super::patterns::{
     should_inject_anomaly, AnomalyPatternConfig, ClusterManager, EntityTargetingManager,
     TemporalPattern,
 };
-use super::scheme_advancer::{SchemeAdvancer, SchemeAdvancerConfig};
+use super::scheme_advancer::{MultiStageAnomalyLabel, SchemeAdvancer, SchemeAdvancerConfig};
 use super::schemes::{SchemeAction, SchemeContext};
 use super::strategies::{DuplicationStrategy, StrategyCollection};
 use super::types::AnomalyTypeSelector;
@@ -70,8 +70,28 @@ pub struct AnomalyInjectorConfig {
 pub struct EnhancedInjectionConfig {
     /// Enable multi-stage fraud scheme generation.
     pub multi_stage_schemes_enabled: bool,
-    /// Probability of starting a new scheme per perpetrator per year.
+    /// Probability of starting a new scheme per perpetrator per year (fallback when per-scheme unset).
     pub scheme_probability: f64,
+    /// Per-scheme probability overrides (when set, used instead of scheme_probability).
+    pub scheme_embezzlement_probability: Option<f64>,
+    pub scheme_revenue_manipulation_probability: Option<f64>,
+    pub scheme_kickback_probability: Option<f64>,
+    /// Kickback commission as fraction of vendor usual amount (e.g. 0.15).
+    pub scheme_kickback_amount_shift_percent: Option<f64>,
+    /// Vendor typical order amount range when no prior base is recorded.
+    pub scheme_kickback_vendor_typical_min: Option<f64>,
+    pub scheme_kickback_vendor_typical_max: Option<f64>,
+    pub scheme_triad_bypass_probability: Option<f64>,
+    pub scheme_shadow_payroll_probability: Option<f64>,
+    pub scheme_expense_laundering_probability: Option<f64>,
+    pub scheme_smurfing_probability: Option<f64>,
+    pub scheme_circular_funding_probability: Option<f64>,
+    pub scheme_phantom_warehousing_probability: Option<f64>,
+    pub scheme_intercompany_wash_trade_probability: Option<f64>,
+    /// Maximum concurrent schemes.
+    pub max_concurrent_schemes: Option<usize>,
+    /// Whether to allow repeat perpetrators.
+    pub allow_repeat_perpetrators: Option<bool>,
     /// Enable correlated anomaly injection.
     pub correlated_injection_enabled: bool,
     /// Enable temporal clustering (period-end spikes).
@@ -179,6 +199,8 @@ pub struct AnomalyInjector {
     employee_contexts: HashMap<String, EmployeeContext>,
     /// Account contexts keyed by account code.
     account_contexts: HashMap<String, AccountContext>,
+    /// Counter for scheme-derived anomaly IDs (ANO-S00000001, ...).
+    scheme_label_count: u32,
 }
 
 /// Injection statistics tracking.
@@ -212,14 +234,75 @@ impl AnomalyInjector {
         let entity_targeting =
             EntityTargetingManager::new(config.patterns.entity_targeting.clone());
 
-        // Initialize enhanced components based on configuration
+        // Initialize enhanced components based on configuration.
+        // Note: The scheme advancer is only used when the runtime (or caller) invokes
+        // maybe_start_scheme() per period and advance_schemes() per day. process_entries()
+        // does not call these, so multi-stage scheme labels (scenario_id, pathology_name)
+        // are only produced if the orchestrator drives the advancer separately.
+        let default_scheme_p = config.enhanced.scheme_probability;
         let scheme_advancer = if config.enhanced.multi_stage_schemes_enabled {
             let scheme_config = SchemeAdvancerConfig {
-                embezzlement_probability: config.enhanced.scheme_probability,
-                revenue_manipulation_probability: config.enhanced.scheme_probability * 0.5,
-                kickback_probability: config.enhanced.scheme_probability * 0.5,
+                embezzlement_probability: config
+                    .enhanced
+                    .scheme_embezzlement_probability
+                    .unwrap_or(default_scheme_p),
+                revenue_manipulation_probability: config
+                    .enhanced
+                    .scheme_revenue_manipulation_probability
+                    .unwrap_or(default_scheme_p),
+                kickback_probability: config
+                    .enhanced
+                    .scheme_kickback_probability
+                    .unwrap_or(default_scheme_p),
+                kickback_amount_shift_percent: config
+                    .enhanced
+                    .scheme_kickback_amount_shift_percent
+                    .unwrap_or(0.15),
+                kickback_vendor_typical_amount_min: config
+                    .enhanced
+                    .scheme_kickback_vendor_typical_min
+                    .unwrap_or(5_000.0),
+                kickback_vendor_typical_amount_max: config
+                    .enhanced
+                    .scheme_kickback_vendor_typical_max
+                    .unwrap_or(50_000.0),
+                triad_bypass_probability: config
+                    .enhanced
+                    .scheme_triad_bypass_probability
+                    .unwrap_or(default_scheme_p),
+                shadow_payroll_probability: config
+                    .enhanced
+                    .scheme_shadow_payroll_probability
+                    .unwrap_or(default_scheme_p),
+                expense_laundering_probability: config
+                    .enhanced
+                    .scheme_expense_laundering_probability
+                    .unwrap_or(default_scheme_p),
+                smurfing_probability: config
+                    .enhanced
+                    .scheme_smurfing_probability
+                    .unwrap_or(default_scheme_p),
+                circular_funding_probability: config
+                    .enhanced
+                    .scheme_circular_funding_probability
+                    .unwrap_or(default_scheme_p),
+                phantom_warehousing_probability: config
+                    .enhanced
+                    .scheme_phantom_warehousing_probability
+                    .unwrap_or(default_scheme_p),
+                intercompany_wash_trade_probability: config
+                    .enhanced
+                    .scheme_intercompany_wash_trade_probability
+                    .unwrap_or(default_scheme_p),
+                max_concurrent_schemes: config
+                    .enhanced
+                    .max_concurrent_schemes
+                    .unwrap_or(5),
+                allow_repeat_perpetrators: config
+                    .enhanced
+                    .allow_repeat_perpetrators
+                    .unwrap_or(false),
                 seed: rng.random(),
-                ..Default::default()
             };
             Some(SchemeAdvancer::new(scheme_config))
         } else {
@@ -297,6 +380,7 @@ impl AnomalyInjector {
             vendor_contexts: HashMap::new(),
             employee_contexts: HashMap::new(),
             account_contexts: HashMap::new(),
+            scheme_label_count: 0,
         }
     }
 
@@ -438,6 +522,16 @@ impl AnomalyInjector {
         // Count duplicates
         let duplicates_created = duplicates.len();
 
+        // Merge multi-stage scheme labels into main labels (so they appear in result)
+        if let Some(ref advancer) = self.scheme_advancer {
+            for ms in advancer.get_labels() {
+                if let Some(label) = self.multi_stage_label_to_labeled_anomaly(ms) {
+                    self.labels.push(label);
+                    self.stats.total_injected += 1;
+                }
+            }
+        }
+
         // Build summary
         let summary = AnomalySummary::from_anomalies(&self.labels);
 
@@ -452,6 +546,59 @@ impl AnomalyInjector {
             scheme_actions: self.scheme_actions.clone(),
             difficulty_distribution: self.difficulty_distribution.clone(),
         }
+    }
+
+    /// Converts a multi-stage scheme label to a LabeledAnomaly for export.
+    fn multi_stage_label_to_labeled_anomaly(&self, ms: &MultiStageAnomalyLabel) -> Option<LabeledAnomaly> {
+        use SchemeType::*;
+        let fraud_type = match ms.scheme_type {
+            GradualEmbezzlement => FraudType::AssetMisappropriation,
+            RevenueManipulation => FraudType::RevenueManipulation,
+            VendorKickback => FraudType::Kickback,
+            TriadBypass => FraudType::InvoiceManipulation,
+            ShadowPayroll => FraudType::GhostEmployee,
+            ExpenseLaundering => FraudType::FictitiousVendor,
+            Smurfing => FraudType::SplitTransaction,
+            CircularFunding => FraudType::SuspenseAccountAbuse,
+            PhantomWarehousing => FraudType::InventoryTheft,
+            IntercompanyWashTrades => FraudType::FictitiousTransaction,
+            RoundTripping => FraudType::SuspenseAccountAbuse,
+            GhostEmployee => FraudType::GhostEmployee,
+            ExpenseReimbursement => FraudType::AssetMisappropriation,
+            InventoryTheft => FraudType::InventoryTheft,
+            Custom => FraudType::FictitiousTransaction,
+        };
+        // Use a synthetic scheme document per action so each scheme action
+        // (stage/date) has its own document id in the viewer.
+        // This does not currently correspond to a real JE in journal_entries.csv,
+        // but clearly distinguishes actions instead of collapsing the whole
+        // scheme into a single document.
+        let document_id = format!("scheme-{}", ms.action_id);
+        let anomaly_date = ms.anomaly_date.unwrap_or_else(|| {
+            NaiveDate::from_ymd_opt(2024, 1, 1).expect("2024-01-01 is a valid date")
+        });
+        let mut label = LabeledAnomaly::new(
+            ms.anomaly_id.clone(),
+            AnomalyType::Fraud(fraud_type),
+            document_id.clone(),
+            "scheme".to_string(),
+            String::new(), // company_code not stored on MultiStageAnomalyLabel
+            anomaly_date,
+        );
+        label = label
+            .with_metadata("pathology_name", &ms.pathology_name)
+            .with_metadata("pathology_category", &ms.pathology_category)
+            .with_metadata("scheme_type", ms.scheme_type.name())
+            .with_metadata("stage", &format!("{}/{}", ms.stage_number, ms.total_stages))
+            .with_metadata("perpetrator_id", &ms.perpetrator_id)
+            .with_scenario(&ms.scheme_id.to_string());
+        if let Some(ref cp) = ms.counterparty {
+            label = label.with_metadata("counterparty", cp);
+        }
+        if let Some(ref amt) = ms.action_amount {
+            label = label.with_metadata("action_amount", &amt.to_string());
+        }
+        Some(label)
     }
 
     /// Checks if an entry should be processed.
@@ -910,12 +1057,41 @@ impl AnomalyInjector {
     ///
     /// Call this method once per simulated day to generate scheme actions.
     /// Returns the scheme actions generated for this date.
-    pub fn advance_schemes(&mut self, date: NaiveDate, company_code: &str) -> Vec<SchemeAction> {
+    /// Pass `available_users`, `available_accounts`, and `available_counterparties` so that
+    /// schemes (e.g. circular funding) can attach a concrete vendor/customer to each action,
+    /// which is used to populate FEC auxiliary account fields (Compte aux. / Libellé aux.) in materialized JEs.
+    pub fn advance_schemes(
+        &mut self,
+        date: NaiveDate,
+        company_code: &str,
+        available_users: Vec<String>,
+        available_accounts: Vec<String>,
+        available_counterparties: Vec<String>,
+    ) -> Vec<SchemeAction> {
         if let Some(ref mut advancer) = self.scheme_advancer {
-            let context = SchemeContext::new(date, company_code);
+            let mut context = SchemeContext::new(date, company_code);
+            context.available_users = available_users;
+            context.available_accounts = available_accounts;
+            context.available_counterparties = available_counterparties;
             let actions = advancer.advance_all(&context);
-            self.scheme_actions.extend(actions.clone());
-            actions
+            for action in &actions {
+                let anomaly_id = format!("ANO-S{:08}", self.scheme_label_count);
+                self.scheme_label_count = self.scheme_label_count.saturating_add(1);
+                advancer.record_label(anomaly_id, action);
+            }
+            advancer.flush_completed_schemes(&context);
+            // Persist actions with company code so runtime can later materialize them
+            // into journal entries in the correct company.
+            let company = company_code.to_string();
+            let mut actions_with_company = Vec::with_capacity(actions.len());
+            for mut action in actions {
+                if action.company_code.is_none() {
+                    action.company_code = Some(company.clone());
+                }
+                actions_with_company.push(action.clone());
+            }
+            self.scheme_actions.extend(actions_with_company.clone());
+            actions_with_company
         } else {
             Vec::new()
         }
@@ -989,6 +1165,17 @@ impl AnomalyInjector {
             advancer.active_scheme_count()
         } else {
             0
+        }
+    }
+
+    /// Returns a summary of active schemes (id, type, status).
+    pub fn active_schemes_summary(
+        &self,
+    ) -> Vec<(uuid::Uuid, datasynth_core::models::SchemeType, super::schemes::SchemeStatus)> {
+        if let Some(ref advancer) = self.scheme_advancer {
+            advancer.active_schemes_summary()
+        } else {
+            Vec::new()
         }
     }
 

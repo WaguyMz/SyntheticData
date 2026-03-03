@@ -1736,10 +1736,23 @@ impl JournalEntryGenerator {
         };
 
         all.choose(&mut self.rng).copied().unwrap_or_else(|| {
-            tracing::warn!(
-                "Account selection returned empty list, falling back to first COA account"
-            );
-            &self.coa.accounts[0]
+            // COA may have no Asset/Expense accounts (e.g. French PCG with complexity cap
+            // fills class-by-class so class 6/7 can be missing). Fall back to any debit-normal account.
+            let debit_side: Vec<_> = self
+                .coa
+                .get_postable_accounts()
+                .into_iter()
+                .filter(|a| a.normal_debit_balance)
+                .collect();
+            debit_side
+                .choose(&mut self.rng)
+                .copied()
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        "No debit-normal accounts in COA, using first postable account"
+                    );
+                    &self.coa.accounts[0]
+                })
         })
     }
 
@@ -1756,10 +1769,23 @@ impl JournalEntryGenerator {
         };
 
         all.choose(&mut self.rng).copied().unwrap_or_else(|| {
-            tracing::warn!(
-                "Account selection returned empty list, falling back to first COA account"
-            );
-            &self.coa.accounts[0]
+            // COA may have no Liability/Revenue accounts (e.g. French PCG with complexity cap).
+            // Fall back to any credit-normal account.
+            let credit_side: Vec<_> = self
+                .coa
+                .get_postable_accounts()
+                .into_iter()
+                .filter(|a| !a.normal_debit_balance)
+                .collect();
+            credit_side
+                .choose(&mut self.rng)
+                .copied()
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        "No credit-normal accounts in COA, using first postable account"
+                    );
+                    &self.coa.accounts[0]
+                })
         })
     }
 }

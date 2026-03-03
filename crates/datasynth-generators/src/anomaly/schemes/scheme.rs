@@ -1,6 +1,6 @@
 //! Core fraud scheme trait and types.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rand::Rng;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -180,6 +180,9 @@ pub struct SchemeAction {
     pub action_id: Uuid,
     /// Scheme ID this action belongs to.
     pub scheme_id: Uuid,
+    /// Scheme type (for materialization to use typical accounts per pathology).
+    #[serde(default)]
+    pub scheme_type: Option<SchemeType>,
     /// Stage this action belongs to.
     pub stage: u32,
     /// Type of action.
@@ -202,6 +205,15 @@ pub struct SchemeAction {
     pub concealment_techniques: Vec<ConcealmentTechnique>,
     /// Whether this action has been executed.
     pub executed: bool,
+    /// Company code in which this action should be executed.
+    ///
+    /// This is populated by the injector when schemes are advanced so that
+    /// runtime materialization can create journal entries in the correct company.
+    #[serde(default)]
+    pub company_code: Option<String>,
+    /// Optional reference (e.g. invoice number) to link related actions (invoice + payment).
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 impl SchemeAction {
@@ -212,12 +224,24 @@ impl SchemeAction {
         action_type: SchemeActionType,
         target_date: NaiveDate,
     ) -> Self {
-        // Derive deterministic action_id from scheme_id + stage using FNV-1a hash
+        // Derive deterministic, unique action_id from scheme_id + stage + target_date
+        // so that each action (same stage on different days) gets a distinct document_id.
+        // Previously only scheme_id + stage was used, so all actions in a stage shared one id.
         let action_id = {
             let scheme_bytes = scheme_id.as_bytes();
             let stage_bytes = stage.to_le_bytes();
+            let date_bytes = [
+                target_date.year() as u8,
+                (target_date.year() >> 8) as u8,
+                target_date.month() as u8,
+                target_date.day() as u8,
+            ];
             let mut hash: u64 = 0xcbf29ce484222325;
-            for &b in scheme_bytes.iter().chain(stage_bytes.iter()) {
+            for &b in scheme_bytes
+                .iter()
+                .chain(stage_bytes.iter())
+                .chain(date_bytes.iter())
+            {
                 hash ^= b as u64;
                 hash = hash.wrapping_mul(0x100000001b3);
             }
@@ -225,7 +249,6 @@ impl SchemeAction {
             let mut uuid_bytes = [0u8; 16];
             uuid_bytes[..8].copy_from_slice(&bytes);
             uuid_bytes[8..16].copy_from_slice(&bytes);
-            // Set version 4 bits for compatibility
             uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
             uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
             Uuid::from_bytes(uuid_bytes)
@@ -233,6 +256,7 @@ impl SchemeAction {
         Self {
             action_id,
             scheme_id,
+            scheme_type: None,
             stage,
             action_type,
             target_date,
@@ -244,7 +268,21 @@ impl SchemeAction {
             detection_difficulty: AnomalyDetectionDifficulty::Moderate,
             concealment_techniques: Vec::new(),
             executed: false,
+            company_code: None,
+            reference: None,
         }
+    }
+
+    /// Sets the reference (e.g. invoice number for P2P linking).
+    pub fn with_reference(mut self, reference: impl Into<String>) -> Self {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// Sets the scheme type (for materialization to pick typical accounts).
+    pub fn with_scheme_type(mut self, scheme_type: SchemeType) -> Self {
+        self.scheme_type = Some(scheme_type);
+        self
     }
 
     /// Sets the amount.
@@ -320,6 +358,21 @@ pub enum SchemeActionType {
     Conceal,
     /// Cover up tracks.
     CoverUp,
+    // RIP-GNN pathology lab action types
+    /// Reuse an old document ID (triad bypass).
+    ReuseDocumentId,
+    /// Create a ghost employee.
+    CreateGhostEmployee,
+    /// Create a ghost bank account.
+    CreateGhostBankAccount,
+    /// Create a micro-expense (expense laundering).
+    CreateMicroExpense,
+    /// Create a shell vendor.
+    CreateShellVendor,
+    /// Intercompany round-trip transaction.
+    IntercompanyRoundTrip,
+    /// Transfer inventory to ghost location.
+    InventoryTransferToGhostLocation,
 }
 
 /// Trait for fraud schemes.

@@ -46,11 +46,13 @@ pub mod control_accounts {
 
     /// Intercompany AP – Class 4
     pub const IC_AP_CLEARING: &str = "401800";
+    /// Factures non encore établies / Invoices to be issued (Class 4) – revenue manipulation adjustment
+    pub const INVOICES_TO_BE_ISSUED: &str = "418100";
 }
 
 /// Cash and bank – Class 5
 pub mod cash_accounts {
-    pub const OPERATING_CASH: &str = "530000";
+    pub const OPERATING_CASH: &str = "512000";
     pub const BANK_ACCOUNT: &str = "512000";
     pub const PETTY_CASH: &str = "531000";
 }
@@ -70,6 +72,20 @@ pub mod expense_accounts {
     pub const SALARIES_WAGES: &str = "641100";
     pub const RENT: &str = "613000";
     pub const INTEREST_EXPENSE: &str = "661000";
+    /// Honoraires / consulting (Class 6)
+    pub const HONORAIRES: &str = "622600";
+    /// Études de marché / market research (Class 6) – kickback typical account
+    pub const MARKET_RESEARCH: &str = "622700";
+    /// Publicité / advertising (Class 6) – expense laundering typical account
+    pub const ADVERTISING: &str = "623000";
+    /// Divers / misc services (Class 6) – expense laundering typical account
+    pub const MISC_SERVICES: &str = "628000";
+    /// Fournitures de bureau / office supplies (Class 6) – embezzlement salami typical account
+    pub const OFFICE_SUPPLIES: &str = "606300";
+    /// Entretien / maintenance (Class 6) – embezzlement salami typical account
+    pub const MAINTENANCE: &str = "615000";
+    /// Cotisations sociales / Social security (URSSAF) (Class 6) – shadow payroll typical
+    pub const SOCIAL_SECURITY: &str = "645100";
 }
 
 /// Equity and liabilities – Class 1

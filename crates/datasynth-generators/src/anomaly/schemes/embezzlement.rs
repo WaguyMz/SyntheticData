@@ -10,7 +10,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use datasynth_core::uuid_factory::{DeterministicUuidFactory, GeneratorType};
+// scheme_id is provided by the advancer to avoid collisions across schemes.
 
 use datasynth_core::models::{
     AnomalyDetectionDifficulty, ConcealmentTechnique, SchemeDetectionStatus, SchemeType,
@@ -60,7 +60,7 @@ pub struct GradualEmbezzlementScheme {
 
 impl GradualEmbezzlementScheme {
     /// Creates a new gradual embezzlement scheme.
-    pub fn new(perpetrator_id: impl Into<String>) -> Self {
+    pub fn new(scheme_id: Uuid, perpetrator_id: impl Into<String>) -> Self {
         let stages = vec![
             // Stage 1: Testing (2 months, $100-500, hard to detect)
             SchemeStage::new(
@@ -109,10 +109,8 @@ impl GradualEmbezzlementScheme {
             .with_technique(ConcealmentTechnique::FalseDocumentation),
         ];
 
-        let uuid_factory = DeterministicUuidFactory::new(0, GeneratorType::Anomaly);
-
         Self {
-            scheme_id: uuid_factory.next(),
+            scheme_id,
             perpetrator_id: perpetrator_id.into(),
             start_date: None,
             current_stage_index: 0,
@@ -303,6 +301,7 @@ impl FraudScheme for GradualEmbezzlementScheme {
                 SchemeActionType::CreateFraudulentEntry,
                 context.current_date,
             )
+            .with_scheme_type(self.scheme_type())
             .with_amount(amount)
             .with_user(&self.perpetrator_id)
             .with_difficulty(stage.detection_difficulty)
@@ -397,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_embezzlement_scheme_creation() {
-        let scheme = GradualEmbezzlementScheme::new("USER001")
+        let scheme = GradualEmbezzlementScheme::new(Uuid::nil(), "USER001")
             .with_accounts(vec!["5000".to_string(), "6000".to_string()]);
 
         assert_eq!(scheme.perpetrator_id, "USER001");
@@ -408,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_embezzlement_scheme_stages() {
-        let scheme = GradualEmbezzlementScheme::new("USER001");
+        let scheme = GradualEmbezzlementScheme::new(Uuid::nil(), "USER001");
 
         // Check stage progression
         assert_eq!(scheme.stages[0].name, "testing");
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     fn test_embezzlement_scheme_advance() {
         let mut scheme =
-            GradualEmbezzlementScheme::new("USER001").with_accounts(vec!["5000".to_string()]);
+            GradualEmbezzlementScheme::new(Uuid::nil(), "USER001").with_accounts(vec!["5000".to_string()]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let context = SchemeContext::new(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(), "1000")
@@ -453,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_embezzlement_scheme_pauses_during_audit() {
-        let mut scheme = GradualEmbezzlementScheme::new("USER001");
+        let mut scheme = GradualEmbezzlementScheme::new(Uuid::nil(), "USER001");
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let context = SchemeContext::new(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(), "1000")
@@ -477,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_embezzlement_scheme_terminates_on_high_detection() {
-        let mut scheme = GradualEmbezzlementScheme::new("USER001");
+        let mut scheme = GradualEmbezzlementScheme::new(Uuid::nil(), "USER001");
         scheme.start(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
 
         let context = SchemeContext::new(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(), "1000")

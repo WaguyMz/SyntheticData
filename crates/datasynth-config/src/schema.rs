@@ -7862,6 +7862,11 @@ pub struct EnhancedAnomalyConfig {
     #[serde(default)]
     pub rates: AnomalyRateConfig,
 
+    /// High-level fraud actor configuration (which vendors/customers/employees/companies
+    /// are eligible to participate in fraud schemes).
+    #[serde(default)]
+    pub fraud_actors: FraudActorsConfig,
+
     /// Multi-stage fraud scheme configuration.
     #[serde(default)]
     pub multi_stage_schemes: MultiStageSchemeConfig,
@@ -7931,6 +7936,46 @@ impl Default for AnomalyRateConfig {
     }
 }
 
+/// Share of master data entities to treat as potential fraud actors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FraudActorShareConfig {
+    /// Approximate share (0.0–1.0) of entities in this category marked as fraud actors.
+    #[serde(default = "default_fraud_actor_share")]
+    pub share: f64,
+}
+
+fn default_fraud_actor_share() -> f64 {
+    0.02
+}
+
+impl Default for FraudActorShareConfig {
+    fn default() -> Self {
+        Self {
+            share: default_fraud_actor_share(),
+        }
+    }
+}
+
+/// Configuration for high-level fraud actors in master data.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FraudActorsConfig {
+    /// Vendor fraud actors (e.g., kickback, circular funding counterparties).
+    #[serde(default)]
+    pub vendors: FraudActorShareConfig,
+
+    /// Customer fraud actors (e.g., circular funding, revenue schemes).
+    #[serde(default)]
+    pub customers: FraudActorShareConfig,
+
+    /// Employee fraud actors (perpetrators capable of starting schemes).
+    #[serde(default)]
+    pub employees: FraudActorShareConfig,
+
+    /// High-risk companies / entities for intercompany schemes.
+    #[serde(default)]
+    pub companies: FraudActorShareConfig,
+}
+
 /// Multi-stage fraud scheme configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MultiStageSchemeConfig {
@@ -7949,6 +7994,87 @@ pub struct MultiStageSchemeConfig {
     /// Vendor kickback scheme configuration.
     #[serde(default)]
     pub kickback: KickbackSchemeConfig,
+
+    /// Triad bypass (process bypass / re-used invoice) scheme probability.
+    #[serde(default)]
+    pub triad_bypass: SchemeProbabilityOnlyConfig,
+
+    /// Shadow payroll (ghost worker) scheme probability.
+    #[serde(default)]
+    pub shadow_payroll: SchemeProbabilityOnlyConfig,
+
+    /// Expense laundering (entropy fan-out to shell vendors) scheme probability.
+    #[serde(default)]
+    pub expense_laundering: SchemeProbabilityOnlyConfig,
+
+    /// Smurfing (threshold evasion via many small payments) scheme probability.
+    #[serde(default)]
+    pub smurfing: SchemeProbabilityOnlyConfig,
+
+    /// Circular funding (round-tripping A→B→C→A) scheme probability.
+    #[serde(default)]
+    pub circular_funding: SchemeProbabilityOnlyConfig,
+
+    /// Phantom warehousing (inventory cycles to ghost locations) scheme probability.
+    #[serde(default)]
+    pub phantom_warehousing: SchemeProbabilityOnlyConfig,
+
+    /// Intercompany wash trades (symmetric cancelling trades) scheme probability.
+    #[serde(default)]
+    pub intercompany_wash_trade: SchemeProbabilityOnlyConfig,
+
+    /// Number of journal entries per (company, month) that grant one scheme start attempt.
+    /// Higher value = fewer attempts per month for the same volume. Default 5000.
+    #[serde(default = "default_entries_per_start_attempt")]
+    pub entries_per_start_attempt: u64,
+
+    /// Maximum scheme start attempts per company per month (volume cap). Default 10.
+    #[serde(default = "default_max_starts_per_company_per_month")]
+    pub max_starts_per_company_per_month: u32,
+
+    /// Maximum number of schemes running concurrently. Default 5.
+    #[serde(default = "default_max_concurrent_schemes")]
+    pub max_concurrent_schemes: usize,
+
+    /// Whether to allow the same perpetrator in multiple concurrent schemes. Default false.
+    #[serde(default = "default_allow_repeat_perpetrators")]
+    pub allow_repeat_perpetrators: bool,
+}
+
+fn default_entries_per_start_attempt() -> u64 {
+    5000
+}
+
+fn default_max_starts_per_company_per_month() -> u32 {
+    10
+}
+
+fn default_max_concurrent_schemes() -> usize {
+    5
+}
+
+fn default_allow_repeat_perpetrators() -> bool {
+    false
+}
+
+/// Config for scheme types that only expose a probability (no stage/amount tuning).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemeProbabilityOnlyConfig {
+    /// Probability of starting this scheme type per period.
+    #[serde(default = "default_scheme_probability_simple")]
+    pub probability: f64,
+}
+
+fn default_scheme_probability_simple() -> f64 {
+    0.01
+}
+
+impl Default for SchemeProbabilityOnlyConfig {
+    fn default() -> Self {
+        Self {
+            probability: default_scheme_probability_simple(),
+        }
+    }
 }
 
 /// Embezzlement scheme configuration.
@@ -8090,6 +8216,19 @@ pub struct KickbackSchemeConfig {
     #[serde(default = "default_kickback_percent")]
     pub kickback_percent: f64,
 
+    /// Commission / amount shift as fraction of the vendor's usual (base) amount — suggests the fraud.
+    /// Kickback payment amount = vendor_typical_base_amount * amount_shift_percent (capped by remaining budget).
+    #[serde(default = "default_kickback_amount_shift_percent")]
+    pub amount_shift_percent: f64,
+
+    /// Minimum "usual" order amount for this vendor when no prior inflated invoice exists (for sampling baseline).
+    #[serde(default = "default_kickback_vendor_typical_min")]
+    pub vendor_typical_amount_min: f64,
+
+    /// Maximum "usual" order amount for this vendor when no prior inflated invoice exists.
+    #[serde(default = "default_kickback_vendor_typical_max")]
+    pub vendor_typical_amount_max: f64,
+
     /// Setup duration in months.
     #[serde(default = "default_kickback_setup_months")]
     pub setup_months: u32,
@@ -8111,6 +8250,15 @@ fn default_kickback_inflation_max() -> f64 {
 fn default_kickback_percent() -> f64 {
     0.50
 }
+fn default_kickback_amount_shift_percent() -> f64 {
+    0.15
+}
+fn default_kickback_vendor_typical_min() -> f64 {
+    5_000.0
+}
+fn default_kickback_vendor_typical_max() -> f64 {
+    50_000.0
+}
 fn default_kickback_setup_months() -> u32 {
     3
 }
@@ -8125,6 +8273,9 @@ impl Default for KickbackSchemeConfig {
             inflation_min: default_kickback_inflation_min(),
             inflation_max: default_kickback_inflation_max(),
             kickback_percent: default_kickback_percent(),
+            amount_shift_percent: default_kickback_amount_shift_percent(),
+            vendor_typical_amount_min: default_kickback_vendor_typical_min(),
+            vendor_typical_amount_max: default_kickback_vendor_typical_max(),
             setup_months: default_kickback_setup_months(),
             operation_months: default_kickback_operation_months(),
         }

@@ -2097,6 +2097,21 @@ pub enum SchemeType {
     InventoryTheft,
     /// Custom scheme type.
     Custom,
+    // RIP-GNN pathology lab schemes
+    /// Process bypass / re-used invoice ID (triad bypass).
+    TriadBypass,
+    /// Shadow payroll (ghost worker).
+    ShadowPayroll,
+    /// Expense laundering (entropy fan-out to shell vendors).
+    ExpenseLaundering,
+    /// Smurfing (threshold evasion via many small payments).
+    Smurfing,
+    /// Circular funding (round-tripping A→B→C→A).
+    CircularFunding,
+    /// Phantom warehousing (inventory cycles to ghost locations).
+    PhantomWarehousing,
+    /// Intercompany wash trades (symmetric cancelling trades).
+    IntercompanyWashTrades,
 }
 
 impl SchemeType {
@@ -2111,6 +2126,13 @@ impl SchemeType {
             SchemeType::ExpenseReimbursement => "expense_reimbursement",
             SchemeType::InventoryTheft => "inventory_theft",
             SchemeType::Custom => "custom",
+            SchemeType::TriadBypass => "triad_bypass",
+            SchemeType::ShadowPayroll => "shadow_payroll",
+            SchemeType::ExpenseLaundering => "expense_laundering",
+            SchemeType::Smurfing => "smurfing",
+            SchemeType::CircularFunding => "circular_funding",
+            SchemeType::PhantomWarehousing => "phantom_warehousing",
+            SchemeType::IntercompanyWashTrades => "intercompany_wash_trades",
         }
     }
 
@@ -2125,6 +2147,13 @@ impl SchemeType {
             SchemeType::ExpenseReimbursement => 3, // submission, approval, payment
             SchemeType::InventoryTheft => 3,      // access, theft, cover-up
             SchemeType::Custom => 4,
+            SchemeType::TriadBypass => 3,         // setup, bypass, concealment
+            SchemeType::ShadowPayroll => 3,       // create ghost, payroll, concealment
+            SchemeType::ExpenseLaundering => 3,   // shell vendors, micro-expenses, concealment
+            SchemeType::Smurfing => 3,            // target path, small payments, concealment
+            SchemeType::CircularFunding => 3,     // setup loans, execution, reversal
+            SchemeType::PhantomWarehousing => 3,   // ghost locations, cycles, concealment
+            SchemeType::IntercompanyWashTrades => 3, // setup, wash trades, concealment
         }
     }
 }

@@ -11,7 +11,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use datasynth_core::uuid_factory::{DeterministicUuidFactory, GeneratorType};
+// scheme_id is provided by the advancer to avoid collisions across schemes.
 
 use datasynth_core::models::{
     AnomalyDetectionDifficulty, ConcealmentTechnique, SchemeDetectionStatus, SchemeType,
@@ -59,7 +59,7 @@ pub struct RevenueManipulationScheme {
 
 impl RevenueManipulationScheme {
     /// Creates a new revenue manipulation scheme.
-    pub fn new(perpetrator_id: impl Into<String>) -> Self {
+    pub fn new(scheme_id: Uuid, perpetrator_id: impl Into<String>) -> Self {
         let stages = vec![
             // Stage 1: Early revenue recognition (Q4, ~2% inflation)
             SchemeStage::new(
@@ -67,7 +67,7 @@ impl RevenueManipulationScheme {
                 "early_revenue_recognition",
                 3,
                 (dec!(50000), dec!(500000)),
-                (3, 8),
+                (1, 3),
                 AnomalyDetectionDifficulty::Hard,
             )
             .with_description("Premature recognition of revenue before performance obligations met")
@@ -79,7 +79,7 @@ impl RevenueManipulationScheme {
                 "expense_deferral",
                 3,
                 (dec!(25000), dec!(200000)),
-                (5, 15),
+                (1, 3),
                 AnomalyDetectionDifficulty::Moderate,
             )
             .with_description("Deferral of current period expenses to future periods")
@@ -90,7 +90,7 @@ impl RevenueManipulationScheme {
                 "reserve_release",
                 3,
                 (dec!(100000), dec!(1000000)),
-                (2, 5),
+                (1, 2),
                 AnomalyDetectionDifficulty::Moderate,
             )
             .with_description("Inappropriate release of excess reserves to boost income")
@@ -101,7 +101,7 @@ impl RevenueManipulationScheme {
                 "channel_stuffing",
                 3,
                 (dec!(200000), dec!(2000000)),
-                (3, 10),
+                (3, 6),
                 AnomalyDetectionDifficulty::Easy,
             )
             .with_description("Pushing excess inventory to distributors with side agreements")
@@ -109,10 +109,8 @@ impl RevenueManipulationScheme {
             .with_technique(ConcealmentTechnique::Collusion),
         ];
 
-        let uuid_factory = DeterministicUuidFactory::new(0, GeneratorType::Anomaly);
-
         Self {
-            scheme_id: uuid_factory.next(),
+            scheme_id,
             perpetrator_id: perpetrator_id.into(),
             start_date: None,
             current_stage_index: 0,
@@ -283,6 +281,7 @@ impl FraudScheme for RevenueManipulationScheme {
                 action_type,
                 context.current_date,
             )
+            .with_scheme_type(self.scheme_type())
             .with_amount(amount)
             .with_user(&self.perpetrator_id)
             .with_difficulty(stage.detection_difficulty)
@@ -290,6 +289,12 @@ impl FraudScheme for RevenueManipulationScheme {
                 "Revenue manipulation: {} (Q{})",
                 stage.name, quarter
             ));
+
+            // Attach a concrete customer so AR (411*) lines can populate Compte aux.
+            if !context.available_counterparties.is_empty() {
+                let idx = rng.random_range(0..context.available_counterparties.len());
+                action = action.with_counterparty(&context.available_counterparties[idx]);
+            }
 
             // Add concealment techniques
             for technique in &stage.concealment_techniques {
@@ -364,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_revenue_manipulation_creation() {
-        let scheme = RevenueManipulationScheme::new("CFO001");
+        let scheme = RevenueManipulationScheme::new(Uuid::nil(), "CFO001");
 
         assert_eq!(scheme.perpetrator_id, "CFO001");
         assert_eq!(scheme.stages.len(), 4);
@@ -373,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_revenue_manipulation_stages() {
-        let scheme = RevenueManipulationScheme::new("CFO001");
+        let scheme = RevenueManipulationScheme::new(Uuid::nil(), "CFO001");
 
         assert_eq!(scheme.stages[0].name, "early_revenue_recognition");
         assert_eq!(scheme.stages[1].name, "expense_deferral");
@@ -411,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_revenue_manipulation_advance() {
-        let mut scheme = RevenueManipulationScheme::new("CFO001");
+        let mut scheme = RevenueManipulationScheme::new(Uuid::nil(), "CFO001");
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Test at quarter end

@@ -50,8 +50,10 @@ pub use scheme_advancer::{
     MultiStageAnomalyLabel, SchemeAdvancer, SchemeAdvancerConfig, SchemeStatistics,
 };
 pub use schemes::{
-    FraudScheme, GradualEmbezzlementScheme, RevenueManipulationScheme, SchemeAction,
-    SchemeActionType, SchemeContext, SchemeStage, SchemeStatus, VendorKickbackScheme,
+    CircularFundingScheme, ExpenseLaunderingScheme, FraudScheme, GradualEmbezzlementScheme,
+    IntercompanyWashTradeScheme, PhantomWarehousingScheme, RevenueManipulationScheme,
+    SchemeAction, SchemeActionType, SchemeContext, SchemeStage, SchemeStatus,
+    ShadowPayrollScheme, SmurfingScheme, TriadBypassScheme, VendorKickbackScheme,
 };
 pub use severity::{
     AnomalyScoreCalculator, AnomalyScores, SeverityCalculator, SeverityConfig, SeverityContext,

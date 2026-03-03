@@ -25,6 +25,7 @@ use std::sync::Arc;
 use chrono::{Datelike, NaiveDate};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -44,6 +45,7 @@ use datasynth_core::models::sourcing::{
 use datasynth_core::models::subledger::ap::APInvoice;
 use datasynth_core::models::subledger::ar::ARInvoice;
 use datasynth_core::models::*;
+use datasynth_core::pcg;
 use datasynth_core::traits::Generator;
 use datasynth_core::{DegradationActions, DegradationLevel, ResourceGuard, ResourceGuardBuilder};
 use datasynth_fingerprint::{
@@ -55,6 +57,7 @@ use datasynth_generators::{
     // Anomaly injection
     AnomalyInjector,
     AnomalyInjectorConfig,
+    EnhancedInjectionConfig,
     AssetGenerator,
     // Audit generators
     AuditEngagementGenerator,
@@ -108,6 +111,8 @@ use datasynth_generators::{
     SourcingProjectGenerator,
     SpendAnalysisGenerator,
     ValidationError,
+    SchemeAction,
+    SchemeActionType,
     // Master data generators
     VendorGenerator,
     WorkpaperGenerator,
@@ -128,7 +133,7 @@ use datasynth_core::diffusion::{DiffusionBackend, DiffusionConfig, StatisticalDi
 use datasynth_core::llm::MockLlmProvider;
 use datasynth_core::models::balance::{GeneratedOpeningBalance, IndustryType, OpeningBalanceSpec};
 use datasynth_core::models::documents::PaymentMethod;
-use datasynth_core::models::IndustrySector;
+use datasynth_core::models::{AccountSubType, AccountType, IndustrySector, SchemeType};
 use datasynth_generators::coa_generator::CoAFramework;
 use datasynth_generators::llm_enrichment::VendorLlmEnricher;
 use rayon::prelude::*;
@@ -171,6 +176,7 @@ fn convert_p2p_config(schema_config: &P2PFlowConfig) -> P2PGeneratorConfig {
             payment_correction_rate: payment_behavior.payment_correction_rate,
             avg_days_until_remainder: payment_behavior.avg_days_until_remainder,
         },
+        vat_rate: 0.0,
     }
 }
 
@@ -202,6 +208,7 @@ fn convert_o2c_config(schema_config: &O2CFlowConfig) -> O2CGeneratorConfig {
             payment_correction_rate: payment_behavior.payment_corrections.rate,
             avg_days_until_remainder: payment_behavior.partial_payments.avg_days_until_remainder,
         },
+        vat_rate: 0.0,
     }
 }
 
@@ -1503,7 +1510,7 @@ impl EnhancedOrchestrator {
         }
 
         // Phase 8: Anomaly Injection (after all JE-generating phases)
-        let anomaly_labels = self.phase_anomaly_injection(&mut entries, &actions, &mut stats)?;
+        let anomaly_labels = self.phase_anomaly_injection(&mut entries, &coa, &actions, &mut stats)?;
 
         // Phase 9: Balance Validation (after all JEs including payroll, manufacturing, IC)
         let balance_validation = self.phase_balance_validation(&entries)?;
@@ -1740,6 +1747,7 @@ impl EnhancedOrchestrator {
         if self.phase_config.generate_master_data {
             info!("Phase 2: Generating Master Data");
             self.generate_master_data()?;
+            self.tag_fraud_actors();
             stats.vendor_count = self.master_data.vendors.len();
             stats.customer_count = self.master_data.customers.len();
             stats.material_count = self.master_data.materials.len();
@@ -1807,13 +1815,25 @@ impl EnhancedOrchestrator {
                 .map(|c| c.currency.as_str())
                 .unwrap_or("USD");
 
+            // When using French PCG, override FA GL accounts to use framework
+            // mappings (official PCG fixed asset, accumulated depreciation,
+            // depreciation expense and bank accounts) instead of the generic
+            // 15xx/1599 placeholders from the subledger defaults.
+            let fa_framework_accounts = if self.resolve_coa_framework()
+                == datasynth_generators::CoAFramework::FrenchPcg
+            {
+                Some(datasynth_core::FrameworkAccounts::french_gaap())
+            } else {
+                None
+            };
+
             let mut fa_gen = datasynth_generators::FAGenerator::new(
                 datasynth_generators::FAGeneratorConfig::default(),
                 rand_chacha::ChaCha8Rng::seed_from_u64(self.seed + 70),
             );
 
             for asset in &self.master_data.assets {
-                let (record, je) = fa_gen.generate_asset_acquisition(
+                let (mut record, mut je) = fa_gen.generate_asset_acquisition(
                     company_code,
                     &format!("{:?}", asset.asset_class),
                     &asset.description,
@@ -1821,6 +1841,38 @@ impl EnhancedOrchestrator {
                     currency,
                     asset.cost_center.as_deref(),
                 );
+
+                if let Some(ref fa_accounts) = fa_framework_accounts {
+                    // Remember original GL accounts so we can rewrite the JE lines.
+                    let old_acq = record.account_determination.acquisition_account.clone();
+                    let old_clear = record.account_determination.clearing_account.clone();
+
+                    // Use framework-specific PCG accounts for FA postings.
+                    record.account_determination.acquisition_account =
+                        fa_accounts.fixed_assets.clone();
+                    record
+                        .account_determination
+                        .accumulated_depreciation_account =
+                        fa_accounts.accumulated_depreciation.clone();
+                    record.account_determination.depreciation_account =
+                        fa_accounts.accumulated_depreciation.clone();
+                    record.account_determination.depreciation_expense_account =
+                        fa_accounts.depreciation_expense.clone();
+                    // Credit bank for the acquisition instead of using a generic 1599 clearing.
+                    record.account_determination.clearing_account =
+                        fa_accounts.bank_account.clone();
+
+                    for line in je.lines.iter_mut() {
+                        if line.gl_account == old_acq {
+                            line.gl_account =
+                                record.account_determination.acquisition_account.clone();
+                        } else if line.gl_account == old_clear {
+                            line.gl_account =
+                                record.account_determination.clearing_account.clone();
+                        }
+                    }
+                }
+
                 subledger.fa_records.push(record);
                 fa_journal_entries.push(je);
             }
@@ -1960,7 +2012,8 @@ impl EnhancedOrchestrator {
     /// Phase 5: Inject anomalies into journal entries.
     fn phase_anomaly_injection(
         &mut self,
-        entries: &mut [JournalEntry],
+        entries: &mut Vec<JournalEntry>,
+        coa: &Arc<ChartOfAccounts>,
         actions: &DegradationActions,
         stats: &mut EnhancedGenerationStatistics,
     ) -> SynthResult<AnomalyLabels> {
@@ -1969,7 +2022,7 @@ impl EnhancedOrchestrator {
             && !actions.skip_anomaly_injection
         {
             info!("Phase 5: Injecting Anomalies");
-            let result = self.inject_anomalies(entries)?;
+            let result = self.inject_anomalies(entries, coa)?;
             stats.anomalies_injected = result.labels.len();
             info!("Injected {} anomalies", stats.anomalies_injected);
             self.check_resources_with_log("post-anomaly-injection")?;
@@ -5068,6 +5121,81 @@ impl EnhancedOrchestrator {
         Ok(())
     }
 
+    /// Tag a subset of vendors/customers/employees as fraud actors based on config shares.
+    fn tag_fraud_actors(&mut self) {
+        let enhanced = &self.config.anomaly_injection;
+        let actors = &enhanced.fraud_actors;
+
+        // Use a deterministic RNG so the same config/seed yields the same actors.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(self.seed.wrapping_add(0xF_A55_A55));
+
+        fn tag_slice<T, F>(rng: &mut rand_chacha::ChaCha8Rng, items: &mut [T], share: f64, mut mark: F)
+        where
+            F: FnMut(&mut T),
+        {
+            if items.is_empty() || share <= 0.0 {
+                return;
+            }
+            let mut indices: Vec<usize> = (0..items.len()).collect();
+            indices.shuffle(rng);
+            let target = ((items.len() as f64) * share.max(0.0).min(1.0)).round() as usize;
+            let target = target.min(items.len());
+            for &idx in indices.iter().take(target) {
+                mark(&mut items[idx]);
+            }
+        }
+
+        tag_slice(
+            &mut rng,
+            &mut self.master_data.vendors,
+            actors.vendors.share,
+            |v| {
+                v.is_fraud_actor = true;
+            },
+        );
+        tag_slice(
+            &mut rng,
+            &mut self.master_data.customers,
+            actors.customers.share,
+            |c| {
+                c.is_fraud_actor = true;
+            },
+        );
+        tag_slice(
+            &mut rng,
+            &mut self.master_data.employees,
+            actors.employees.share,
+            |e| {
+                e.is_fraud_actor = true;
+            },
+        );
+    }
+
+    /// Resolve VAT rate for document-flow invoices (P2P and O2C) when tax.vat_gst.enabled.
+    /// Tries: exact company country key, then 2-letter uppercase (e.g. FRA→FR), then any rate from standard_rates, then 0.20 so VAT lines appear.
+    fn resolve_vat_rate_for_document_flows(&self) -> f64 {
+        let country = self
+            .config
+            .companies
+            .first()
+            .map(|c| c.country.trim())
+            .unwrap_or("");
+        let rates = &self.config.tax.vat_gst.standard_rates;
+        if rates.is_empty() {
+            return 0.20; // default so VAT lines appear when VAT is enabled
+        }
+        if let Some(&r) = rates.get(country) {
+            return r;
+        }
+        let two_letter: String = country.chars().take(2).collect::<String>().to_uppercase();
+        if !two_letter.is_empty() {
+            if let Some(&r) = rates.get(&two_letter) {
+                return r;
+            }
+        }
+        rates.values().next().copied().unwrap_or(0.20)
+    }
+
     /// Generate document flows (P2P and O2C).
     fn generate_document_flows(&mut self, flows: &mut DocumentFlowSnapshot) -> SynthResult<()> {
         let start_date = NaiveDate::parse_from_str(&self.config.global.start_date, "%Y-%m-%d")
@@ -5083,7 +5211,16 @@ impl EnhancedOrchestrator {
         let pb = self.create_progress_bar(p2p_count as u64, "Generating P2P Document Flows");
 
         // Convert P2P config from schema to generator config
-        let p2p_config = convert_p2p_config(&self.config.document_flows.p2p);
+        let mut p2p_config = convert_p2p_config(&self.config.document_flows.p2p);
+        if self.config.tax.enabled && self.config.tax.vat_gst.enabled {
+            let vat_rate = self.resolve_vat_rate_for_document_flows();
+            p2p_config.vat_rate = vat_rate;
+            if vat_rate > 0.0 {
+                info!(vat_rate = %vat_rate, "VAT enabled for P2P: vendor invoices will include tax lines");
+            } else {
+                warn!("VAT enabled but no rate found for company country; P2P invoices will have no tax lines");
+            }
+        }
         let mut p2p_gen = P2PGenerator::with_config(self.seed + 1000, p2p_config);
         p2p_gen.set_country_pack(self.primary_pack().clone());
 
@@ -5154,7 +5291,16 @@ impl EnhancedOrchestrator {
         let pb = self.create_progress_bar(o2c_count as u64, "Generating O2C Document Flows");
 
         // Convert O2C config from schema to generator config
-        let o2c_config = convert_o2c_config(&self.config.document_flows.o2c);
+        let mut o2c_config = convert_o2c_config(&self.config.document_flows.o2c);
+        if self.config.tax.enabled && self.config.tax.vat_gst.enabled {
+            let vat_rate = self.resolve_vat_rate_for_document_flows();
+            o2c_config.vat_rate = vat_rate;
+            if vat_rate > 0.0 {
+                info!(vat_rate = %vat_rate, "VAT enabled for O2C: customer invoices will include tax lines");
+            } else {
+                warn!("VAT enabled but no rate found for company country; O2C invoices will have no tax lines");
+            }
+        }
         let mut o2c_gen = O2CGenerator::with_config(self.seed + 2000, o2c_config);
         o2c_gen.set_country_pack(self.primary_pack().clone());
 
@@ -6045,7 +6191,14 @@ impl EnhancedOrchestrator {
     }
 
     /// Inject anomalies into journal entries.
-    fn inject_anomalies(&mut self, entries: &mut [JournalEntry]) -> SynthResult<AnomalyLabels> {
+    ///
+    /// Also materializes multi-stage scheme actions into synthetic journal entries so that
+    /// every scheme instance has at least one backing JE that the viewer can display.
+    fn inject_anomalies(
+        &mut self,
+        entries: &mut Vec<JournalEntry>,
+        coa: &Arc<ChartOfAccounts>,
+    ) -> SynthResult<AnomalyLabels> {
         let pb = self.create_progress_bar(entries.len() as u64, "Injecting Anomalies");
 
         // Read anomaly rates from config instead of using hardcoded values.
@@ -6076,6 +6229,36 @@ impl EnhancedOrchestrator {
             AnomalyRateConfig::default().process_issue_rate
         };
 
+        let ai = &self.config.anomaly_injection;
+        let schemes = &ai.multi_stage_schemes;
+        let enhanced = EnhancedInjectionConfig {
+            multi_stage_schemes_enabled: schemes.enabled,
+            scheme_probability: schemes.embezzlement.probability,
+            scheme_embezzlement_probability: Some(schemes.embezzlement.probability),
+            scheme_revenue_manipulation_probability: Some(schemes.revenue_manipulation.probability),
+            scheme_kickback_probability: Some(schemes.kickback.probability),
+            scheme_kickback_amount_shift_percent: Some(schemes.kickback.amount_shift_percent),
+            scheme_kickback_vendor_typical_min: Some(schemes.kickback.vendor_typical_amount_min),
+            scheme_kickback_vendor_typical_max: Some(schemes.kickback.vendor_typical_amount_max),
+            scheme_triad_bypass_probability: Some(schemes.triad_bypass.probability),
+            scheme_shadow_payroll_probability: Some(schemes.shadow_payroll.probability),
+            scheme_expense_laundering_probability: Some(schemes.expense_laundering.probability),
+            scheme_smurfing_probability: Some(schemes.smurfing.probability),
+            scheme_circular_funding_probability: Some(schemes.circular_funding.probability),
+            scheme_phantom_warehousing_probability: Some(schemes.phantom_warehousing.probability),
+            scheme_intercompany_wash_trade_probability: Some(schemes.intercompany_wash_trade.probability),
+            max_concurrent_schemes: Some(schemes.max_concurrent_schemes),
+            allow_repeat_perpetrators: Some(schemes.allow_repeat_perpetrators),
+            correlated_injection_enabled: ai.correlated_injection.enabled,
+            temporal_clustering_enabled: ai.correlated_injection.temporal_clustering,
+            period_end_multiplier: ai.correlated_injection.temporal_clustering_config.period_end_multiplier,
+            near_miss_enabled: ai.near_miss.enabled,
+            near_miss_proportion: ai.near_miss.proportion,
+            difficulty_classification_enabled: ai.difficulty_classification.enabled,
+            context_aware_enabled: ai.context_aware.enabled,
+            ..Default::default()
+        };
+
         let anomaly_config = AnomalyInjectorConfig {
             rates: AnomalyRateConfig {
                 total_rate,
@@ -6085,11 +6268,194 @@ impl EnhancedOrchestrator {
                 ..Default::default()
             },
             seed: self.seed + 5000,
+            enhanced,
             ..Default::default()
         };
 
         let mut injector = AnomalyInjector::new(anomaly_config);
-        let result = injector.process_entries(entries);
+
+        // Drive multi-stage scheme advancer so all configured scheme types can produce labels.
+        // We advance schemes once per calendar day in the posting-date range for each company,
+        // rather than only on days that have journal entries. This gives schemes enough
+        // consecutive "days" to progress through stages and emit actions/labels.
+        if schemes.enabled && !entries.is_empty() {
+            use std::collections::{BTreeSet, HashMap, HashSet};
+            let companies: Vec<String> = entries
+                .iter()
+                .map(|e| e.header.company_code.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            // Total entries across the dataset for volume-dependent scheme start attempts.
+            // `entries_per_start_attempt` is compared to this global count (per company is
+            // handled by iterating over companies below), not to a per-month bucket.
+            let total_entries: u64 = entries.len() as u64;
+
+            let (min_date, max_date): (Option<NaiveDate>, Option<NaiveDate>) = entries
+                .iter()
+                .map(|e| e.header.posting_date)
+                .fold((None, None), |(min, max), d: NaiveDate| {
+                    (
+                        Some(min.map_or(d, |m| m.min(d))),
+                        Some(max.map_or(d, |m| m.max(d))),
+                    )
+                });
+
+            let date_company: Vec<(NaiveDate, String)> = match (min_date, max_date) {
+                (Some(start), Some(end)) => {
+                    let mut out = Vec::new();
+                    let mut d = start;
+                    while d <= end {
+                        for c in &companies {
+                            out.push((d, c.clone()));
+                        }
+                        d = d
+                            .succ_opt()
+                            .expect("NaiveDate.succ_opt should succeed within finite range");
+                    }
+                    out
+                }
+                _ => Vec::new(),
+            };
+            let mut users: Vec<String> = self
+                .master_data
+                .employees
+                .iter()
+                .filter(|e| e.is_fraud_actor)
+                .map(|e| e.user_id.clone())
+                .collect();
+            if users.is_empty() {
+                // Fallback: if no employees were tagged as fraud actors (e.g., share=0),
+                // allow all employees to act as potential perpetrators.
+                users = self
+                    .master_data
+                    .employees
+                    .iter()
+                    .map(|e| e.user_id.clone())
+                    .collect();
+            }
+
+            let total_scheme_prob: f64 = schemes.embezzlement.probability
+                + schemes.revenue_manipulation.probability
+                + schemes.kickback.probability
+                + schemes.triad_bypass.probability
+                + schemes.shadow_payroll.probability
+                + schemes.expense_laundering.probability
+                + schemes.smurfing.probability
+                + schemes.circular_funding.probability
+                + schemes.phantom_warehousing.probability
+                + schemes.intercompany_wash_trade.probability;
+            if users.is_empty() {
+                warn!(
+                    "Multi-stage schemes enabled but no employees (user_id) in master_data: \
+                     scheme phase will not start any schemes. Ensure master_data is generated \
+                     (generate_master_data: true) and employees exist (master_data.employees.count > 0)."
+                );
+            } else if total_scheme_prob <= 0.0 {
+                warn!(
+                    "Multi-stage schemes enabled but sum of scheme probabilities is 0: \
+                     no scheme will ever start. Set at least one of anomaly_injection.multi_stage_schemes.*.probability > 0."
+                );
+            } else {
+                debug!(
+                    "Scheme phase: {} users, {} companies, {} date-company pairs, scheme start prob sum: {:.4}",
+                    users.len(),
+                    companies.len(),
+                    date_company.len(),
+                    total_scheme_prob
+                );
+            }
+            let accounts: Vec<String> = coa
+                .get_postable_accounts()
+                .into_iter()
+                .map(|a| a.account_number.clone())
+                .collect();
+            let mut counterparties: Vec<String> = self
+                .master_data
+                .vendors
+                .iter()
+                .filter(|v| v.is_fraud_actor)
+                .map(|v| v.vendor_id.clone())
+                .collect();
+            counterparties.extend(
+                self.master_data
+                    .customers
+                    .iter()
+                    .filter(|c| c.is_fraud_actor)
+                    .map(|c| c.customer_id.clone()),
+            );
+            if counterparties.is_empty() {
+                // Fallback: if no vendors/customers tagged, allow all as potential scheme actors.
+                counterparties = self
+                    .master_data
+                    .vendors
+                    .iter()
+                    .map(|v| v.vendor_id.clone())
+                    .chain(
+                        self.master_data
+                            .customers
+                            .iter()
+                            .map(|c| c.customer_id.clone()),
+                    )
+                    .collect();
+            }
+
+            let entries_per_attempt = schemes.entries_per_start_attempt.max(1);
+            let max_starts_per_month = schemes.max_starts_per_company_per_month.max(1) as u64;
+            let month_starts: BTreeSet<(i32, u32)> =
+                date_company.iter().map(|(d, _)| (d.year(), d.month())).collect();
+            for (y, m) in month_starts {
+                let first = NaiveDate::from_ymd_opt(y, m, 1).unwrap_or_else(|| {
+                    NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
+                });
+                for company_code in &companies {
+                    let entries_count = total_entries;
+
+                    let attempts = (entries_count / entries_per_attempt)
+                        .min(max_starts_per_month)
+                        .max(1) as usize;
+                    for _ in 0..attempts {
+                        injector.maybe_start_scheme(
+                            first,
+                            company_code,
+                            users.clone(),
+                            accounts.clone(),
+                            counterparties.clone(),
+                        );
+                    }
+
+                    debug!(
+                        "Scheme start month {}-{:02} company {}: active schemes={}, entries_count={}",
+                        y,
+                        m,
+                        company_code,
+                        injector.active_scheme_count(),
+                        entries_count,
+                    );
+                    let mut by_type: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for (_, t, _) in injector.active_schemes_summary() {
+                        *by_type.entry(t.name().to_string()).or_insert(0) += 1;
+                    }
+                    debug!("Active scheme types: {:?}", by_type);
+                }
+            }
+            for (date, company_code) in date_company {
+                injector.advance_schemes(
+                    date,
+                    &company_code,
+                    users.clone(),
+                    accounts.clone(),
+                    counterparties.clone(),
+                );
+            }
+        }
+
+        // Snapshot scheme actions before process_entries (which clears them internally)
+        let scheme_actions: Vec<SchemeAction> = injector.get_scheme_actions().to_vec();
+
+        let result = injector.process_entries(entries.as_mut_slice());
 
         if let Some(pb) = &pb {
             pb.inc(entries.len() as u64);
@@ -6103,11 +6469,767 @@ impl EnhancedOrchestrator {
                 .or_insert(0) += 1;
         }
 
+        // Materialize scheme actions into journal entries (one balanced JE per action).
+        // This ensures every scheme instance has at least one concrete transaction in journal_entries.csv.
+        if !scheme_actions.is_empty() {
+            // Build auxiliary partner map: partner_id → (auxiliary GL account or ID, label).
+            let mut auxiliary_map: HashMap<String, (String, String)> = HashMap::new();
+            for vendor in &self.master_data.vendors {
+                let aux_account = vendor
+                    .auxiliary_gl_account
+                    .clone()
+                    .unwrap_or_else(|| vendor.vendor_id.clone());
+                auxiliary_map
+                    .insert(vendor.vendor_id.clone(), (aux_account, vendor.name.clone()));
+            }
+            for customer in &self.master_data.customers {
+                let aux_account = customer
+                    .auxiliary_gl_account
+                    .clone()
+                    .unwrap_or_else(|| customer.customer_id.clone());
+                auxiliary_map.insert(
+                    customer.customer_id.clone(),
+                    (aux_account, customer.name.clone()),
+                );
+            }
+
+            let scheme_jes =
+                Self::materialize_scheme_actions(&scheme_actions, coa, &auxiliary_map);
+            let count = scheme_jes.len();
+            if count > 0 {
+                entries.extend(scheme_jes);
+                info!(
+                    "Materialized {} scheme actions as journal entries (document_id = action_id for viewer link)",
+                    count
+                );
+            } else {
+                warn!("materialize_scheme_actions returned 0 JEs for {} actions", scheme_actions.len());
+            }
+        } else if schemes.enabled {
+            info!(
+                "Multi-stage schemes enabled but 0 scheme actions produced (no scheme JEs added). \
+                 Typical causes: (1) no employees in master_data (user_id list empty), \
+                 (2) all scheme probabilities are 0 in anomaly_injection.multi_stage_schemes, \
+                 (3) RNG never drew start or schemes never emitted actions in the date range."
+            );
+        }
+
         Ok(AnomalyLabels {
             labels: result.labels,
             summary: Some(result.summary),
             by_type,
         })
+    }
+
+    /// Scheme-relevant GL accounts (AP, AR, bank, expense, revenue) resolved from CoA
+    /// so that all schemes use vendor/customer/cash accounts consistent with the chart.
+    fn scheme_gl_accounts(coa: &ChartOfAccounts) -> (String, String, String, String, String) {
+        if coa.country == "FR" {
+            (
+                pcg::control_accounts::AP_CONTROL.to_string(),
+                pcg::control_accounts::AR_CONTROL.to_string(),
+                pcg::cash_accounts::BANK_ACCOUNT.to_string(),
+                pcg::expense_accounts::COGS.to_string(),
+                pcg::revenue_accounts::PRODUCT_REVENUE.to_string(),
+            )
+        } else {
+            let first_non_generic = |v: Vec<&GLAccount>| {
+                v.into_iter()
+                    .map(|a| a.account_number.clone())
+                    .find(|code| code != "100000" && code != "101100")
+            };
+            let ap = first_non_generic(coa.get_accounts_by_sub_type(AccountSubType::AccountsPayable))
+                .unwrap_or_else(|| datasynth_core::accounts::control_accounts::AP_CONTROL.to_string());
+            let ar = first_non_generic(coa.get_accounts_by_sub_type(AccountSubType::AccountsReceivable))
+                .unwrap_or_else(|| datasynth_core::accounts::control_accounts::AR_CONTROL.to_string());
+            let bank = first_non_generic(coa.get_accounts_by_sub_type(AccountSubType::Cash))
+                .unwrap_or_else(|| datasynth_core::accounts::cash_accounts::BANK_ACCOUNT.to_string());
+            let expense = first_non_generic(coa.get_accounts_by_sub_type(AccountSubType::CostOfGoodsSold))
+                .or_else(|| first_non_generic(
+                    coa.get_accounts_by_type(datasynth_core::models::AccountType::Expense),
+                ))
+                .unwrap_or_else(|| datasynth_core::accounts::expense_accounts::COGS.to_string());
+            let revenue = first_non_generic(coa.get_accounts_by_sub_type(AccountSubType::ProductRevenue))
+                .or_else(|| first_non_generic(coa.get_accounts_by_type(AccountType::Revenue)))
+                .unwrap_or_else(|| datasynth_core::accounts::revenue_accounts::PRODUCT_REVENUE.to_string());
+            (ap, ar, bank, expense, revenue)
+        }
+    }
+
+    /// Turn scheme actions into journal entries so labels can be linked
+    /// to actual transactions in the viewer.
+    ///
+    /// Strategy:
+    /// - document_id is set to `action_id` so that labels with
+    ///   `document_id = "scheme-{action_id}"` match exactly one JE.
+    /// - Each action produces exactly one JE with exactly 2 lines (one debit, one credit).
+    ///   So each "document" in the viewer shows 2 journal lines. If you see more (e.g. 6),
+    ///   the viewer may be matching by scenario_id (old data) or showing multiple JEs.
+    /// - Amount: use action.amount when set; otherwise a deterministic default that varies by
+    ///   action_id so amounts are not all identical for actions that omit amount.
+    fn materialize_scheme_actions(
+        actions: &[SchemeAction],
+        coa: &ChartOfAccounts,
+        auxiliary_map: &std::collections::HashMap<String, (String, String)>,
+    ) -> Vec<JournalEntry> {
+        use rust_decimal::Decimal;
+
+        // Simple heuristic: French country → PCG mapping available.
+        let is_pcg = coa.country == "FR";
+
+        let postable: Vec<String> = coa
+            .get_postable_accounts()
+            .into_iter()
+            .map(|a| a.account_number.clone())
+            .collect();
+
+        // Filter out generic placeholder accounts so schemes never post to them.
+        let filtered_postable: Vec<String> = postable
+            .into_iter()
+            .filter(|code| code != "100000" && code != "101100")
+            .collect();
+
+        // Fallback so we always materialize scheme JEs when there are actions.
+        let postable: Vec<String> = if filtered_postable.is_empty() {
+            vec!["600000".to_string(), "2000".to_string()]
+        } else {
+            filtered_postable
+        };
+
+        let default_debit = postable.first().map(|s| s.as_str()).unwrap_or("600000");
+        let default_credit = postable
+            .iter()
+            .find(|s| s.as_str() != default_debit)
+            .map(|s| s.as_str())
+            .unwrap_or("2000");
+
+        let (ap, ar, bank, expense, revenue) = Self::scheme_gl_accounts(coa);
+        // PCG typical accounts from technical report (Single-FEC scope).
+        let (_embezzlement_debit, kickback_expense_debit, expense_laundering_debit, salaries_wages, wages_payable, suspense) = if is_pcg {
+            (
+                pcg::expense_accounts::OFFICE_SUPPLIES.to_string(),
+                pcg::expense_accounts::HONORAIRES.to_string(),
+                pcg::expense_accounts::ADVERTISING.to_string(),
+                pcg::expense_accounts::SALARIES_WAGES.to_string(),
+                pcg::personnel_accounts::WAGES_PAYABLE.to_string(),
+                pcg::suspense_accounts::GENERAL_SUSPENSE.to_string(),
+            )
+        } else {
+            (
+                expense.clone(),
+                expense.clone(),
+                expense.clone(),
+                expense.clone(),
+                bank.clone(),
+                default_debit.to_string(),
+            )
+        };
+
+        let mut out = Vec::with_capacity(actions.len());
+
+        for action in actions {
+            let company = action
+                .company_code
+                .as_deref()
+                .unwrap_or("1000")
+                .to_string();
+
+            // Use action amount when set; otherwise a deterministic default that varies by action_id
+            // so we don't get identical amounts for actions that don't set amount (e.g. CoverUp, CreateFictitiousVendor).
+            // Clamp to a positive value so we never create zero-amount postings.
+            let mut amount = action.amount.unwrap_or_else(|| {
+                let n = action.action_id.as_u128() as u64;
+                let varied = 100u64 + (n % 9900); // 100–9999 so amounts differ per action
+                Decimal::from(varied)
+            });
+            if amount <= Decimal::ZERO {
+                amount = Decimal::from(100u64);
+            }
+
+            // Decide debit / credit accounts. For now we use a simple mapping:
+            // - Prefer the target_account as the "primary" side.
+            // - Use a different generic account as the offset.
+            let preferred = action
+                .target_account
+                .as_deref()
+                .unwrap_or(default_debit);
+
+            let (debit_acct, credit_acct) = match action.action_type {
+                // Expense laundering: Dr Class 6 (623000 Advertising / 628000 Misc), Cr 401xxx (AP with counterparty).
+                SchemeActionType::CreateMicroExpense | SchemeActionType::CreateShellVendor => {
+                    (expense_laundering_debit.as_str(), ap.as_str())
+                }
+                // Gradual embezzlement (salami): Dr 606300/615000, Cr 512000. Shadow payroll recurring: Dr 641100, Cr 421000. Smurfing setup: Dr 471000, Cr 512000.
+                SchemeActionType::CreateFraudulentEntry => {
+                    if is_pcg {
+                        match action.scheme_type {
+                            Some(SchemeType::GradualEmbezzlement) => {
+                                let salami_debit = if (action.action_id.as_u128() % 2) == 0 {
+                                    pcg::expense_accounts::OFFICE_SUPPLIES
+                                } else {
+                                    pcg::expense_accounts::MAINTENANCE
+                                };
+                                (salami_debit, bank.as_str())
+                            }
+                            Some(SchemeType::ShadowPayroll) => {
+                                (salaries_wages.as_str(), wages_payable.as_str())
+                            }
+                            Some(SchemeType::Smurfing) => (suspense.as_str(), bank.as_str()),
+                            _ => {
+                                let offset = if preferred == default_credit {
+                                    default_debit
+                                } else {
+                                    default_credit
+                                };
+                                (preferred, offset)
+                            }
+                        }
+                    } else {
+                        let offset = if preferred == default_credit {
+                            default_debit
+                        } else {
+                            default_credit
+                        };
+                        (preferred, offset)
+                    }
+                }
+                // Revenue manipulation (all stages): Dr 411000 (AR), Cr 701000 (Revenue) — never Class 1.
+                SchemeActionType::ManipulateRevenue
+                | SchemeActionType::DeferExpense
+                | SchemeActionType::ReleaseReserves
+                | SchemeActionType::ChannelStuff => {
+                    (ar.as_str(), revenue.as_str())
+                }
+                SchemeActionType::InventoryTransferToGhostLocation => {
+                    let offset = if preferred == default_credit {
+                        default_debit
+                    } else {
+                        default_credit
+                    };
+                    (preferred, offset)
+                }
+                // Payment-like: Triad/Kickback Dr AP Cr Bank; Smurfing (disbursement layering) Dr 471000 Cr 512000.
+                SchemeActionType::CreateFraudulentPayment
+                | SchemeActionType::MakeKickbackPayment
+                | SchemeActionType::IntercompanyRoundTrip => {
+                    if is_pcg && action.scheme_type == Some(SchemeType::Smurfing) {
+                        (suspense.as_str(), bank.as_str())
+                    } else {
+                        (ap.as_str(), bank.as_str())
+                    }
+                }
+                // Ghost employee: Dr 641100 (Wages), Cr 421000 (Personnel) with aux.
+                SchemeActionType::CreateGhostEmployee => {
+                    (salaries_wages.as_str(), wages_payable.as_str())
+                }
+                // Kickback inflated invoice: Dr 622600/622700, Cr 401000 with aux.
+                SchemeActionType::CreateFictitiousVendor | SchemeActionType::InflateInvoice => {
+                    if is_pcg {
+                        (kickback_expense_debit.as_str(), ap.as_str())
+                    } else {
+                        let debit = default_debit;
+                        let credit = if debit == default_credit {
+                            preferred
+                        } else {
+                            default_credit
+                        };
+                        (debit, credit)
+                    }
+                }
+                SchemeActionType::CreateGhostBankAccount => {
+                    let debit = default_debit;
+                    let credit = if debit == default_credit {
+                        preferred
+                    } else {
+                        default_credit
+                    };
+                    (debit, credit)
+                }
+                // Triad bypass (process bypass): Dr 401000, Cr 512000; Compte aux. on AP.
+                SchemeActionType::ReuseDocumentId => (ap.as_str(), bank.as_str()),
+                SchemeActionType::Conceal | SchemeActionType::CoverUp => {
+                    let debit = default_debit;
+                    let credit = if debit == default_credit {
+                        preferred
+                    } else {
+                        default_credit
+                    };
+                    (debit, credit)
+                }
+            };
+
+            let posting_date = action.target_date;
+
+            // Use action_id as document_id so the viewer can join labels (document_id = "scheme-{action_id}")
+            // to exactly these journal entry lines.
+            let header = JournalEntryHeader::with_deterministic_id(
+                company.clone(),
+                posting_date,
+                action.action_id,
+            );
+
+            let mut entry = JournalEntry::new(header);
+            if let Some(ref ref_str) = action.reference {
+                entry.header.reference = Some(ref_str.clone());
+            }
+
+            // Helper to set Compte aux. / Libellé aux. on AP/AR lines from counterparty and master data.
+            let with_aux = |mut line: JournalEntryLine, gl: &str| {
+                if let Some(cp) = action.counterparty.as_ref() {
+                    if let Some((aux, label)) = auxiliary_map.get(cp) {
+                        if line.gl_account == gl {
+                            line.auxiliary_account_number = Some(aux.clone());
+                            line.auxiliary_account_label = Some(label.clone());
+                        }
+                    } else if line.gl_account == gl {
+                        line.auxiliary_account_number = Some(cp.clone());
+                    }
+                }
+                line
+            };
+
+            match action.action_type {
+                SchemeActionType::IntercompanyRoundTrip => {
+                    if is_pcg {
+                        // French GAAP / PCG: use master-data style accounts consistent with
+                        // the document flow JE generator (P2P/O2C). This ensures that
+                        // circular funding schemes use the same vendor/client/cash/VAT
+                        // accounts as the rest of the dataset.
+                        let ap = pcg::control_accounts::AP_CONTROL; // 401000
+                        let ar = pcg::control_accounts::AR_CONTROL; // 411000
+                        let bank = pcg::cash_accounts::BANK_ACCOUNT; // 512000
+                        let cogs = pcg::expense_accounts::COGS; // 603000
+                        let revenue = pcg::revenue_accounts::PRODUCT_REVENUE; // 701000
+                        let input_vat = pcg::tax_accounts::INPUT_VAT; // 445660
+                        let output_vat = pcg::tax_accounts::OUTPUT_VAT; // 445710
+
+                        // Treat amount as gross TTC on the sale side (A→C) and derive
+                        // net + VAT using a 20% rate (consistent with P2P/O2C config).
+                        let one_point_two = Decimal::new(120, 2); // 1.20
+                        let net = amount / one_point_two;
+                        let vat = amount - net;
+
+                        let mut line_no = 1;
+
+                        // Helper to set auxiliary (Compte aux.) fields on AP/AR lines based
+                        // on the scheme action's counterparty and master data.
+                        let with_aux = |mut line: JournalEntryLine, gl: &str| {
+                            if let Some(cp) = action.counterparty.as_ref() {
+                                if let Some((aux, label)) = auxiliary_map.get(cp) {
+                                    if line.gl_account == gl {
+                                        line.auxiliary_account_number = Some(aux.clone());
+                                        line.auxiliary_account_label = Some(label.clone());
+                                    }
+                                } else if line.gl_account == gl {
+                                    line.auxiliary_account_number = Some(cp.clone());
+                                }
+                            }
+                            line
+                        };
+
+                        // Achat marchandises (fournisseur B):
+                        //   Dr 603000 (COGS)        net
+                        //   Dr 445660 (TVA déduct)  vat
+                        //   Cr 401000 (Fournisseur) amount
+                        let line_cogs = JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            cogs.to_string(),
+                            net,
+                        );
+                        entry.add_line(line_cogs);
+                        line_no += 1;
+                        let line_input_vat = JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            input_vat.to_string(),
+                            vat,
+                        );
+                        entry.add_line(line_input_vat);
+                        line_no += 1;
+                        let line_ap = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            ap.to_string(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, ap));
+                        line_no += 1;
+
+                        // Paiement fournisseur B:
+                        //   Dr 401000 (Fournisseur) amount
+                        //   Cr 512000 (Banque)      amount
+                        let line_ap2 = JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            ap.to_string(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap2, ap));
+                        line_no += 1;
+                        let line_bank_pay = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            bank.to_string(),
+                            amount,
+                        );
+                        entry.add_line(line_bank_pay);
+                        line_no += 1;
+
+                        // Vente à C:
+                        //   Dr 411000 (Client)      amount
+                        //   Cr 701000 (Vente)       net
+                        //   Cr 445710 (TVA coll.)   vat
+                        let line_ar = JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            ar.to_string(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ar, ar));
+                        line_no += 1;
+                        let line_rev = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            revenue.to_string(),
+                            net,
+                        );
+                        entry.add_line(line_rev);
+                        line_no += 1;
+                        let line_output_vat = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            output_vat.to_string(),
+                            vat,
+                        );
+                        entry.add_line(line_output_vat);
+                        line_no += 1;
+
+                        // Encaissement C:
+                        //   Dr 512000 (Banque)      amount
+                        //   Cr 411000 (Client)      amount
+                        let line_bank_recv = JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            bank.to_string(),
+                            amount,
+                        );
+                        entry.add_line(line_bank_recv);
+                        line_no += 1;
+                        let line_ar2 = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            ar.to_string(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ar2, ar));
+                    } else {
+                        // Generic 3-leg cycle when no PCG mapping is available.
+                        let acct_a = debit_acct;     // e.g. expense
+                        let acct_b = default_debit;  // generic
+                        let acct_c = default_credit; // offset
+
+                        let one_third = amount / Decimal::from(3u64);
+                        let leg1 = one_third;
+                        let leg2 = one_third;
+                        let leg3 = amount - leg1 - leg2;
+
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            acct_b.to_string(),
+                            leg1,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            acct_a.to_string(),
+                            leg1,
+                        ));
+
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            3,
+                            acct_c.to_string(),
+                            leg2,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            4,
+                            acct_b.to_string(),
+                            leg2,
+                        ));
+
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            5,
+                            acct_a.to_string(),
+                            leg3,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            6,
+                            acct_c.to_string(),
+                            leg3,
+                        ));
+                    }
+                }
+                // Vendor kickback / triad payment: Dr AP, Cr Bank (or Smurfing: Dr 471000, Cr 512000). Compte aux. on AP when debit is AP.
+                SchemeActionType::MakeKickbackPayment | SchemeActionType::CreateFraudulentPayment => {
+                    let line_debit = JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        debit_acct.to_string(),
+                        amount,
+                    );
+                    entry.add_line(if debit_acct == ap.as_str() {
+                        with_aux(line_debit, &ap)
+                    } else {
+                        line_debit
+                    });
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        credit_acct.to_string(),
+                        amount,
+                    ));
+                }
+                // Inflated invoice / fictitious vendor (kickback).
+                // VendorKickback: full P2P invoice posting with VAT (Dr Expense net, Dr VAT, Cr AP gross).
+                // Other: simple 2-line Dr Expense, Cr AP.
+                SchemeActionType::InflateInvoice | SchemeActionType::CreateFictitiousVendor => {
+                    if is_pcg && action.scheme_type == Some(SchemeType::VendorKickback) {
+                        // End-to-end P2P: invoice posting with VAT (gross = amount, net = amount/1.20, vat = amount - net).
+                        let input_vat = pcg::tax_accounts::INPUT_VAT;
+                        let one_point_two = Decimal::new(120, 2); // 1.20
+                        let net = amount / one_point_two;
+                        let vat = amount - net;
+                        let mut line_no = 1u32;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            kickback_expense_debit.clone(),
+                            net,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            input_vat.to_string(),
+                            vat,
+                        ));
+                        line_no += 1;
+                        let line_ap = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            ap.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, &ap));
+                    } else {
+                        let line_exp = JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            debit_acct.to_string(),
+                            amount,
+                        );
+                        entry.add_line(line_exp);
+                        let line_ap = JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            ap.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, &ap));
+                    }
+                }
+                // Expense laundering (shell vendor / micro-expense): Dr Class 6 (e.g. 622600 Honoraires), Cr AP — Compte aux. on AP.
+                SchemeActionType::CreateMicroExpense | SchemeActionType::CreateShellVendor => {
+                    let line_exp = JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        expense_laundering_debit.clone(),
+                        amount,
+                    );
+                    entry.add_line(line_exp);
+                    let line_ap = JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        ap.clone(),
+                        amount,
+                    );
+                    entry.add_line(with_aux(line_ap, &ap));
+                }
+                // Revenue manipulation (all four stages). PCG: Dr 411000 + Dr 418100 (invoices to be issued), Cr 701000.
+                SchemeActionType::ManipulateRevenue
+                | SchemeActionType::DeferExpense
+                | SchemeActionType::ReleaseReserves
+                | SchemeActionType::ChannelStuff => {
+                    if is_pcg {
+                        let ar_amount = amount * Decimal::new(9, 1); // 0.9 * amount
+                        let adj_amount = amount * Decimal::new(1, 1); // 0.1 * amount
+                        let mut line_no = 1;
+                        entry.add_line(with_aux(
+                            JournalEntryLine::debit(action.scheme_id, line_no, ar.clone(), ar_amount),
+                            &ar,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::control_accounts::INVOICES_TO_BE_ISSUED.to_string(),
+                            adj_amount,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            revenue.clone(),
+                            amount,
+                        ));
+                    } else {
+                        let line_ar = JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            ar.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ar, &ar));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            revenue.clone(),
+                            amount,
+                        ));
+                    }
+                }
+                // Ghost employee. PCG: Dr 641100 (gross) + Dr 645100 (URSSAF 20%), Cr 421000 (gross+social).
+                SchemeActionType::CreateGhostEmployee => {
+                    if is_pcg {
+                        let social = amount * Decimal::new(2, 1); // 20%
+                        let total = amount + social;
+                        let mut line_no = 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            salaries_wages.clone(),
+                            amount,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::expense_accounts::SOCIAL_SECURITY.to_string(),
+                            social,
+                        ));
+                        line_no += 1;
+                        let line_cred = JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            wages_payable.clone(),
+                            total,
+                        );
+                        entry.add_line(with_aux(line_cred, wages_payable.as_str()));
+                    } else {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            debit_acct.to_string(),
+                            amount,
+                        ));
+                        let line_cred = JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            credit_acct.to_string(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_cred, wages_payable.as_str()));
+                    }
+                }
+                // Triad bypass (reuse document ID): payment without new invoice — Dr AP, Cr Bank; Compte aux. on AP.
+                SchemeActionType::ReuseDocumentId => {
+                    let line_ap = JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        ap.clone(),
+                        amount,
+                    );
+                    entry.add_line(with_aux(line_ap, &ap));
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        bank.clone(),
+                        amount,
+                    ));
+                }
+                // Salami (embezzlement) with VAT when PCG: Dr 606300/615000 (net), Dr 445660 (VAT 20%), Cr 512000 (gross).
+                SchemeActionType::CreateFraudulentEntry => {
+                    if is_pcg && action.scheme_type == Some(SchemeType::GradualEmbezzlement) {
+                        let one_point_two = Decimal::new(12, 1);
+                        let net = amount / one_point_two;
+                        let vat = amount - net;
+                        let salami_debit = if (action.action_id.as_u128() % 2) == 0 {
+                            pcg::expense_accounts::OFFICE_SUPPLIES
+                        } else {
+                            pcg::expense_accounts::MAINTENANCE
+                        };
+                        let mut line_no = 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            salami_debit.to_string(),
+                            net,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::tax_accounts::INPUT_VAT.to_string(),
+                            vat,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            bank.clone(),
+                            amount,
+                        ));
+                    } else {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            debit_acct.to_string(),
+                            amount,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            credit_acct.to_string(),
+                            amount,
+                        ));
+                    }
+                }
+                // Default: a simple 2-line balanced entry (generic accounts).
+                _ => {
+                    entry.add_line(JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        debit_acct.to_string(),
+                        amount,
+                    ));
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        credit_acct.to_string(),
+                        amount,
+                    ));
+                }
+            }
+
+            out.push(entry);
+        }
+
+        out
     }
 
     /// Validate journal entries using running balance tracker.

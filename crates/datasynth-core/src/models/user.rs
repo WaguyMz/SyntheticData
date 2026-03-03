@@ -633,6 +633,11 @@ pub struct Employee {
 
     /// Phone number
     pub phone: Option<String>,
+
+    /// Flag indicating this employee is part of the fraud-actor pool and may
+    /// act as a perpetrator in multi-stage fraud schemes.
+    #[serde(default)]
+    pub is_fraud_actor: bool,
 }
 
 impl Employee {
@@ -686,6 +691,7 @@ impl Employee {
             location: None,
             is_shared_services: false,
             phone: None,
+            is_fraud_actor: false,
         }
     }
 

@@ -400,6 +400,11 @@ pub struct Vendor {
 
     /// Purchasing organization
     pub purchasing_org: Option<String>,
+
+    /// Flag indicating this vendor is part of the fraud-actor pool and may
+    /// participate in multi-stage fraud schemes (e.g., kickbacks, circular funding).
+    #[serde(default)]
+    pub is_fraud_actor: bool,
 }
 
 impl Vendor {
@@ -427,6 +432,7 @@ impl Vendor {
             withholding_tax_rate: None,
             is_one_time: false,
             purchasing_org: None,
+            is_fraud_actor: false,
         }
     }
 
@@ -635,6 +641,11 @@ pub struct Customer {
 
     /// Dunning level (0-4)
     pub dunning_level: u8,
+
+    /// Flag indicating this customer is part of the fraud-actor pool and may
+    /// participate in multi-stage fraud schemes (e.g., circular funding).
+    #[serde(default)]
+    pub is_fraud_actor: bool,
 }
 
 impl Customer {
@@ -667,6 +678,7 @@ impl Customer {
             dunning_procedure: None,
             last_dunning_date: None,
             dunning_level: 0,
+            is_fraud_actor: false,
         }
     }
 

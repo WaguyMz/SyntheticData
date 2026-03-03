@@ -46,6 +46,8 @@ pub struct O2CGeneratorConfig {
     pub payment_method_distribution: Vec<(PaymentMethod, f64)>,
     /// Payment behavior configuration
     pub payment_behavior: O2CPaymentBehavior,
+    /// VAT rate (0.0 = no VAT). When > 0, customer invoice lines get tax and JE has VAT Payable line.
+    pub vat_rate: f64,
 }
 
 /// Payment behavior configuration for O2C.
@@ -97,6 +99,7 @@ impl Default for O2CGeneratorConfig {
                 (PaymentMethod::CreditCard, 0.05),
             ],
             payment_behavior: O2CPaymentBehavior::default(),
+            vat_rate: 0.0,
         }
     }
 }
@@ -836,7 +839,7 @@ impl O2CGenerator {
             if let Some(&(qty, cogs)) = delivered_quantities.get(&so_item.base.line_number) {
                 let ci_description =
                     self.pick_line_description("customer_invoice", &so_item.base.description);
-                let item = CustomerInvoiceItem::from_delivery(
+                let mut item = CustomerInvoiceItem::from_delivery(
                     so_item.base.line_number,
                     &ci_description,
                     qty,
@@ -847,6 +850,13 @@ impl O2CGenerator {
                 .with_cogs(cogs)
                 .with_sales_order(&so.header.document_id, so_item.base.line_number);
 
+                if self.config.vat_rate > 0.0 {
+                    let net = item.base.net_amount;
+                    let tax = (net
+                        * Decimal::try_from(self.config.vat_rate).unwrap_or(Decimal::ZERO))
+                        .round_dp(2);
+                    item.base = item.base.with_tax(tax);
+                }
                 invoice.add_item(item);
             }
         }

@@ -509,9 +509,13 @@ impl HypergraphBuilder {
                     );
                     p.insert("country".to_string(), Value::String(vendor.country.clone()));
                     p.insert("is_active".to_string(), Value::Bool(vendor.is_active));
+                    p.insert("is_fraud_actor".to_string(), Value::Bool(vendor.is_fraud_actor));
                     p
                 },
-                features: vec![if vendor.is_active { 1.0 } else { 0.0 }],
+                features: vec![
+                    if vendor.is_active { 1.0 } else { 0.0 },
+                    if vendor.is_fraud_actor { 1.0 } else { 0.0 },
+                ],
                 is_anomaly: false,
                 anomaly_type: None,
                 is_aggregate: false,
@@ -552,9 +556,13 @@ impl HypergraphBuilder {
                         "credit_rating".to_string(),
                         Value::String(format!("{:?}", customer.credit_rating)),
                     );
+                    p.insert("is_fraud_actor".to_string(), Value::Bool(customer.is_fraud_actor));
                     p
                 },
-                features: vec![if customer.is_active { 1.0 } else { 0.0 }],
+                features: vec![
+                    if customer.is_active { 1.0 } else { 0.0 },
+                    if customer.is_fraud_actor { 1.0 } else { 0.0 },
+                ],
                 is_anomaly: false,
                 anomaly_type: None,
                 is_aggregate: false,
@@ -595,14 +603,18 @@ impl HypergraphBuilder {
                         "company_code".to_string(),
                         Value::String(employee.company_code.clone()),
                     );
+                    p.insert("is_fraud_actor".to_string(), Value::Bool(employee.is_fraud_actor));
                     p
                 },
-                features: vec![employee
-                    .approval_limit
-                    .to_string()
-                    .parse::<f64>()
-                    .unwrap_or(0.0)
-                    .ln_1p()],
+                features: vec![
+                    employee
+                        .approval_limit
+                        .to_string()
+                        .parse::<f64>()
+                        .unwrap_or(0.0)
+                        .ln_1p(),
+                    if employee.is_fraud_actor { 1.0 } else { 0.0 },
+                ],
                 is_anomaly: false,
                 anomaly_type: None,
                 is_aggregate: false,

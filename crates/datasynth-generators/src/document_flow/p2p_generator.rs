@@ -46,6 +46,8 @@ pub struct P2PGeneratorConfig {
     pub early_payment_discount_rate: f64,
     /// Payment behavior configuration
     pub payment_behavior: P2PPaymentBehavior,
+    /// VAT rate (0.0 = no VAT). When > 0, vendor invoice lines get tax and JE has Input VAT line.
+    pub vat_rate: f64,
 }
 
 /// Payment behavior configuration for P2P.
@@ -121,6 +123,7 @@ impl Default for P2PGeneratorConfig {
             ],
             early_payment_discount_rate: 0.30,
             payment_behavior: P2PPaymentBehavior::default(),
+            vat_rate: 0.0,
         }
     }
 }
@@ -675,7 +678,7 @@ impl P2PGenerator {
 
                 let vi_description =
                     self.pick_line_description("vendor_invoice", &po_item.base.description);
-                let item = VendorInvoiceItem::from_po_gr(
+                let mut item = VendorInvoiceItem::from_po_gr(
                     po_item.base.line_number,
                     &vi_description,
                     qty,
@@ -688,6 +691,13 @@ impl P2PGenerator {
                     Some(po_item.base.line_number),
                 );
 
+                if self.config.vat_rate > 0.0 {
+                    let net = item.base.net_amount;
+                    let tax = (net
+                        * Decimal::try_from(self.config.vat_rate).unwrap_or(Decimal::ZERO))
+                        .round_dp(2);
+                    item = item.with_tax("VAT", tax);
+                }
                 invoice.add_item(item);
             }
         }

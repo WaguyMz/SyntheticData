@@ -10,7 +10,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use datasynth_core::uuid_factory::{DeterministicUuidFactory, GeneratorType};
+// scheme_id is provided by the advancer to avoid collisions across schemes.
 
 use datasynth_core::models::{
     AnomalyDetectionDifficulty, ConcealmentTechnique, SchemeDetectionStatus, SchemeType,
@@ -58,6 +58,13 @@ pub struct VendorKickbackScheme {
     inflation_percent: f64,
     /// Kickback percentage (typically 50% of inflation).
     kickback_percent: f64,
+    /// Commission / amount shift as fraction of vendor's usual (base) amount — suggests the fraud.
+    amount_shift_percent: f64,
+    /// Typical base amount for this vendor (from first or recent inflated invoice); used to compute kickback amount.
+    vendor_typical_base_amount: Option<Decimal>,
+    /// Fallback range for "usual" amount when no inflated invoice has been recorded yet.
+    vendor_typical_amount_min: Decimal,
+    vendor_typical_amount_max: Decimal,
     /// Legitimate vendor transactions to blend in.
     legitimate_transaction_count: u32,
     /// Inflated transaction count.
@@ -66,7 +73,11 @@ pub struct VendorKickbackScheme {
 
 impl VendorKickbackScheme {
     /// Creates a new vendor kickback scheme.
-    pub fn new(perpetrator_id: impl Into<String>, vendor_id: impl Into<String>) -> Self {
+    pub fn new(
+        scheme_id: Uuid,
+        perpetrator_id: impl Into<String>,
+        vendor_id: impl Into<String>,
+    ) -> Self {
         let stages = vec![
             // Stage 1: Setup (3 months)
             SchemeStage::new(
@@ -74,7 +85,7 @@ impl VendorKickbackScheme {
                 "setup",
                 3,
                 (dec!(0), dec!(0)), // No fraudulent amounts during setup
-                (0, 2),
+                (0, 1),
                 AnomalyDetectionDifficulty::Expert, // Setup is very hard to detect
             )
             .with_description("Establish vendor relationship and trust")
@@ -85,7 +96,7 @@ impl VendorKickbackScheme {
                 "price_inflation",
                 12,
                 (dec!(5000), dec!(100000)),
-                (10, 30),
+                (2, 4),
                 AnomalyDetectionDifficulty::Hard,
             )
             .with_description("Inflate invoice amounts 10-25%")
@@ -97,7 +108,7 @@ impl VendorKickbackScheme {
                 "kickback_payments",
                 6,
                 (dec!(500), dec!(25000)),
-                (5, 15),
+                (1, 3),
                 AnomalyDetectionDifficulty::Moderate,
             )
             .with_description("Receive kickback payments from vendor")
@@ -109,7 +120,7 @@ impl VendorKickbackScheme {
                 "concealment",
                 3,
                 (dec!(0), dec!(0)),
-                (0, 2),
+                (0, 1),
                 AnomalyDetectionDifficulty::Hard,
             )
             .with_description("Cover tracks and maintain relationship")
@@ -117,10 +128,8 @@ impl VendorKickbackScheme {
             .with_technique(ConcealmentTechnique::FalseDocumentation),
         ];
 
-        let uuid_factory = DeterministicUuidFactory::new(0, GeneratorType::Anomaly);
-
         Self {
-            scheme_id: uuid_factory.next(),
+            scheme_id,
             perpetrator_id: perpetrator_id.into(),
             vendor_id: vendor_id.into(),
             start_date: None,
@@ -134,6 +143,10 @@ impl VendorKickbackScheme {
             detection_probability: 0.0,
             inflation_percent: 0.15, // 15% default
             kickback_percent: 0.50,  // 50% of inflation
+            amount_shift_percent: 0.15,
+            vendor_typical_base_amount: None,
+            vendor_typical_amount_min: dec!(5000),
+            vendor_typical_amount_max: dec!(50000),
             legitimate_transaction_count: 0,
             inflated_transaction_count: 0,
         }
@@ -148,6 +161,21 @@ impl VendorKickbackScheme {
     /// Sets the kickback percentage (0.30 to 0.70).
     pub fn with_kickback_percent(mut self, percent: f64) -> Self {
         self.kickback_percent = percent.clamp(0.30, 0.70);
+        self
+    }
+
+    /// Sets the commission / amount shift as fraction of vendor's usual amount (e.g. 0.10–0.25).
+    pub fn with_amount_shift_percent(mut self, percent: f64) -> Self {
+        self.amount_shift_percent = percent.clamp(0.05, 0.50);
+        self
+    }
+
+    /// Sets the fallback range for vendor "usual" amount when no prior inflated invoice exists.
+    pub fn with_vendor_typical_range(mut self, min_amount: f64, max_amount: f64) -> Self {
+        self.vendor_typical_amount_min = Decimal::from_f64_retain(min_amount.min(max_amount))
+            .unwrap_or(dec!(5000));
+        self.vendor_typical_amount_max = Decimal::from_f64_retain(min_amount.max(max_amount))
+            .unwrap_or(dec!(50000));
         self
     }
 
@@ -323,6 +351,7 @@ impl FraudScheme for VendorKickbackScheme {
                         SchemeActionType::CreateFictitiousVendor,
                         context.current_date,
                     )
+                    .with_scheme_type(self.scheme_type())
                     .with_counterparty(&self.vendor_id)
                     .with_user(&self.perpetrator_id)
                     .with_difficulty(stage.detection_difficulty)
@@ -332,50 +361,92 @@ impl FraudScheme for VendorKickbackScheme {
                 }
             }
             1 => {
-                // Price inflation stage
+                // Price inflation stage — full P2P cycle: inflated invoice (billing) + payment with VAT.
+                // Base amount = vendor's "usual" order; total_amount = inflated gross (what company pays).
                 if rng.random::<f64>() < 0.2 {
                     let base_amount = stage.random_amount(rng);
                     let inflation = self.calculate_inflation(base_amount);
                     let total_amount = base_amount + inflation;
 
-                    let mut action = SchemeAction::new(
+                    // Record vendor's usual (base) amount so kickback payments are calculated from it (amount_shift_percent).
+                    self.vendor_typical_base_amount = Some(base_amount);
+
+                    // Shared reference to link invoice JE and payment JE (end-to-end P2P).
+                    let invoice_ref = format!(
+                        "KB-INV-{:08x}-{}",
+                        self.scheme_id.as_u128() as u32,
+                        self.inflated_transaction_count
+                    );
+
+                    // 1) InflateInvoice → materialized as invoice posting JE (Dr Expense, Dr VAT, Cr AP).
+                    let mut inv_action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,
                         SchemeActionType::InflateInvoice,
                         context.current_date,
                     )
+                    .with_scheme_type(self.scheme_type())
                     .with_amount(total_amount)
                     .with_counterparty(&self.vendor_id)
                     .with_user(&self.perpetrator_id)
                     .with_difficulty(stage.detection_difficulty)
+                    .with_reference(&invoice_ref)
                     .with_description(format!(
-                        "Inflated invoice - base: {}, inflation: {}",
-                        base_amount, inflation
+                        "Inflated invoice (P2P) - base: {}, inflation: {}, gross: {}",
+                        base_amount, inflation, total_amount
                     ));
 
                     for technique in &stage.concealment_techniques {
-                        action = action.with_technique(*technique);
+                        inv_action = inv_action.with_technique(*technique);
                     }
 
                     self.inflated_transaction_count += 1;
-                    actions.push(action);
+                    actions.push(inv_action);
+
+                    // 2) Payment of the same inflated invoice (T+N days) → materialized as payment JE (Dr AP, Cr Bank).
+                    let payment_date = context.current_date + chrono::Duration::days(
+                        (5 + (self.inflated_transaction_count as i64) % 11).max(3), // 5–15 days
+                    );
+                    let mut pay_action = SchemeAction::new(
+                        self.scheme_id,
+                        stage.stage_number,
+                        SchemeActionType::MakeKickbackPayment,
+                        payment_date,
+                    )
+                    .with_scheme_type(self.scheme_type())
+                    .with_amount(total_amount)
+                    .with_counterparty(&self.vendor_id)
+                    .with_user(&self.perpetrator_id)
+                    .with_difficulty(stage.detection_difficulty)
+                    .with_reference(&invoice_ref)
+                    .with_description(format!(
+                        "Payment of inflated invoice {} (P2P)",
+                        invoice_ref
+                    ));
+
+                    for technique in &stage.concealment_techniques {
+                        pay_action = pay_action.with_technique(*technique);
+                    }
+
+                    actions.push(pay_action);
                 }
             }
             2 => {
-                // Kickback payment stage
+                // Kickback payment stage — amount = vendor's usual (base) amount × configurable amount_shift_percent (commission).
                 if self.total_impact > Decimal::ZERO && rng.random::<f64>() < 0.15 {
-                    // Calculate kickback based on accumulated inflation
-                    let kickback_amount = if self.total_kickbacks < self.total_impact * dec!(0.5) {
-                        let max_kickback = self.total_impact
-                            * Decimal::from_f64_retain(
-                                self.kickback_percent * self.inflation_percent,
-                            )
+                    let usual_amount = self.vendor_typical_base_amount.unwrap_or_else(|| {
+                        let min_f = self.vendor_typical_amount_min.try_into().unwrap_or(5000.0);
+                        let max_f = self.vendor_typical_amount_max.try_into().unwrap_or(50000.0);
+                        let t = rng.random::<f64>();
+                        Decimal::from_f64_retain(min_f + t * (max_f - min_f)).unwrap_or(self.vendor_typical_amount_min)
+                    });
+                    let shift = Decimal::from_f64_retain(self.amount_shift_percent).unwrap_or(dec!(0.15));
+                    let raw_kickback = usual_amount * shift;
+                    let max_kickback = self.total_impact
+                        * Decimal::from_f64_retain(self.kickback_percent * self.inflation_percent)
                             .unwrap_or(dec!(0.075));
-                        let remaining = max_kickback - self.total_kickbacks;
-                        stage.random_amount(rng).min(remaining).max(dec!(500))
-                    } else {
-                        dec!(0)
-                    };
+                    let remaining = (max_kickback - self.total_kickbacks).max(Decimal::ZERO);
+                    let kickback_amount = raw_kickback.min(remaining).max(dec!(500));
 
                     if kickback_amount > Decimal::ZERO {
                         let mut action = SchemeAction::new(
@@ -384,7 +455,9 @@ impl FraudScheme for VendorKickbackScheme {
                             SchemeActionType::MakeKickbackPayment,
                             context.current_date,
                         )
+                        .with_scheme_type(self.scheme_type())
                         .with_amount(kickback_amount)
+                        .with_counterparty(&self.vendor_id)
                         .with_user(&self.perpetrator_id)
                         .with_difficulty(stage.detection_difficulty)
                         .with_description(format!(
@@ -410,6 +483,7 @@ impl FraudScheme for VendorKickbackScheme {
                         SchemeActionType::CoverUp,
                         context.current_date,
                     )
+                    .with_scheme_type(self.scheme_type())
                     .with_user(&self.perpetrator_id)
                     .with_difficulty(stage.detection_difficulty)
                     .with_description("Cover up kickback scheme evidence")
@@ -487,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_kickback_scheme_creation() {
-        let scheme = VendorKickbackScheme::new("EMP001", "VENDOR001")
+        let scheme = VendorKickbackScheme::new(Uuid::nil(), "EMP001", "VENDOR001")
             .with_inflation_percent(0.20)
             .with_kickback_percent(0.50);
 
@@ -499,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_kickback_scheme_stages() {
-        let scheme = VendorKickbackScheme::new("EMP001", "VENDOR001");
+        let scheme = VendorKickbackScheme::new(Uuid::nil(), "EMP001", "VENDOR001");
 
         assert_eq!(scheme.stages[0].name, "setup");
         assert_eq!(scheme.stages[1].name, "price_inflation");
@@ -509,7 +583,8 @@ mod tests {
 
     #[test]
     fn test_inflation_calculation() {
-        let scheme = VendorKickbackScheme::new("EMP001", "VENDOR001").with_inflation_percent(0.20);
+        let scheme = VendorKickbackScheme::new(Uuid::nil(), "EMP001", "VENDOR001")
+            .with_inflation_percent(0.20);
 
         let base = dec!(10000);
         let inflation = scheme.calculate_inflation(base);
@@ -527,7 +602,8 @@ mod tests {
 
     #[test]
     fn test_kickback_calculation() {
-        let scheme = VendorKickbackScheme::new("EMP001", "VENDOR001").with_kickback_percent(0.50);
+        let scheme = VendorKickbackScheme::new(Uuid::nil(), "EMP001", "VENDOR001")
+            .with_kickback_percent(0.50);
 
         let inflated = dec!(2000);
         let kickback = scheme.calculate_kickback(inflated);
@@ -537,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_kickback_scheme_advance() {
-        let mut scheme = VendorKickbackScheme::new("EMP001", "VENDOR001");
+        let mut scheme = VendorKickbackScheme::new(Uuid::nil(), "EMP001", "VENDOR001");
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let context = SchemeContext::new(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap(), "1000");
