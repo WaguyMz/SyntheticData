@@ -129,7 +129,7 @@ impl ExpenseLaunderingScheme {
     fn sample_micro_amount(&self, context: &SchemeContext, rng: &mut dyn rand::RngCore) -> Decimal {
         let base_max: f64 = context
             .annual_revenue
-            .and_then(|r| r.try_into().ok())
+            .and_then(|r: Decimal| r.try_into().ok())
             .map(|r: f64| (r / 100_000.0_f64).max(50.0))
             .unwrap_or(50.0);
 

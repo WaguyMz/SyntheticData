@@ -784,8 +784,8 @@ impl JournalEntryGenerator {
         // Select company using weighted selector
         let company_code = self.company_selector.select(&mut self.rng).to_string();
 
-        // Sample line item specification
-        let line_spec = self.line_sampler.sample();
+        // Sample line item spec (kept for RNG reproducibility; we use 1 debit + 1 credit per entry to avoid repeating the same account)
+        let _line_spec = self.line_sampler.sample();
 
         // Determine source type using full 4-way distribution
         let source = self.select_source();
@@ -886,55 +886,40 @@ impl JournalEntryGenerator {
             self.apply_human_variation(drift_adjusted_amount)
         };
 
-        // Generate debit lines
-        let debit_amounts = self
-            .amount_sampler
-            .sample_summing_to(line_spec.debit_count, total_amount);
-        for (i, amount) in debit_amounts.into_iter().enumerate() {
-            let account_number = self.select_debit_account().account_number.clone();
-            let mut line = JournalEntryLine::debit(
-                entry.header.document_id,
-                (i + 1) as u32,
-                account_number.clone(),
-                amount,
-            );
-
-            // Generate line text if enabled
-            if self.template_config.descriptions.generate_line_text {
-                line.line_text = Some(self.description_generator.generate_line_text(
-                    &account_number,
-                    &context,
-                    &mut self.rng,
-                ));
-            }
-
-            entry.add_line(line);
+        // One debit and one credit line per entry: avoid repeating the same GL account
+        // in the same document. Multipayment should be represented as separate entries
+        // on different days, not multiple lines with the same account.
+        let debit_account = self.select_debit_account().account_number.clone();
+        let mut debit_line = JournalEntryLine::debit(
+            entry.header.document_id,
+            1,
+            debit_account.clone(),
+            total_amount,
+        );
+        if self.template_config.descriptions.generate_line_text {
+            debit_line.line_text = Some(self.description_generator.generate_line_text(
+                &debit_account,
+                &context,
+                &mut self.rng,
+            ));
         }
+        entry.add_line(debit_line);
 
-        // Generate credit lines - use the SAME amounts to ensure balance
-        let credit_amounts = self
-            .amount_sampler
-            .sample_summing_to(line_spec.credit_count, total_amount);
-        for (i, amount) in credit_amounts.into_iter().enumerate() {
-            let account_number = self.select_credit_account().account_number.clone();
-            let mut line = JournalEntryLine::credit(
-                entry.header.document_id,
-                (line_spec.debit_count + i + 1) as u32,
-                account_number.clone(),
-                amount,
-            );
-
-            // Generate line text if enabled
-            if self.template_config.descriptions.generate_line_text {
-                line.line_text = Some(self.description_generator.generate_line_text(
-                    &account_number,
-                    &context,
-                    &mut self.rng,
-                ));
-            }
-
-            entry.add_line(line);
+        let credit_account = self.select_credit_account().account_number.clone();
+        let mut credit_line = JournalEntryLine::credit(
+            entry.header.document_id,
+            2,
+            credit_account.clone(),
+            total_amount,
+        );
+        if self.template_config.descriptions.generate_line_text {
+            credit_line.line_text = Some(self.description_generator.generate_line_text(
+                &credit_account,
+                &context,
+                &mut self.rng,
+            ));
         }
+        entry.add_line(credit_line);
 
         // Apply persona-based errors if enabled and it's a human user
         if self.persona_errors_enabled && !is_automated {

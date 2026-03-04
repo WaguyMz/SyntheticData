@@ -26,7 +26,7 @@ fn pathology_taxonomy(scheme_type: SchemeType) -> (&'static str, &'static str) {
         TriadBypass => ("TriadBypass", "Relational"),
         ShadowPayroll => ("ShadowPayroll", "Sequential"),
         ExpenseLaundering => ("ExpenseLaundering", "Volume"),
-        Smurfing => ("Smurfing", "Volume"),
+        Smurfing => ("Smurfing", "Volume"), // kept for backward compat with existing labels
         CircularFunding => ("CircularFunding", "Relational"),
         PhantomWarehousing => ("PhantomWarehousing", "Relational"),
         IntercompanyWashTrades => ("IntercompanyWashTrades", "Relational"),
@@ -38,8 +38,8 @@ fn pathology_taxonomy(scheme_type: SchemeType) -> (&'static str, &'static str) {
 
 use super::schemes::{
     ExpenseLaunderingScheme, FraudScheme, GradualEmbezzlementScheme, RevenueManipulationScheme,
-    SchemeAction, SchemeContext, ShadowPayrollScheme, SchemeStatus, SmurfingScheme,
-    TriadBypassScheme, VendorKickbackScheme,
+    SchemeAction, SchemeContext, ShadowPayrollScheme, SchemeStatus, TriadBypassScheme,
+    VendorKickbackScheme,
 };
 
 /// Configuration for scheme generation.
@@ -62,8 +62,6 @@ pub struct SchemeAdvancerConfig {
     pub shadow_payroll_probability: f64,
     /// Probability of starting an expense laundering scheme per period.
     pub expense_laundering_probability: f64,
-    /// Probability of starting a smurfing scheme per period.
-    pub smurfing_probability: f64,
     /// Probability of starting a circular funding scheme per period.
     pub circular_funding_probability: f64,
     /// Probability of starting a phantom warehousing scheme per period.
@@ -90,11 +88,10 @@ impl Default for SchemeAdvancerConfig {
             triad_bypass_probability: 0.005,
             shadow_payroll_probability: 0.005,
             expense_laundering_probability: 0.005,
-            smurfing_probability: 0.005,
             circular_funding_probability: 0.005,
             phantom_warehousing_probability: 0.005,
             intercompany_wash_trade_probability: 0.005,
-            max_concurrent_schemes: 10      ,
+            max_concurrent_schemes: 5,
             allow_repeat_perpetrators: false,
             seed: 42,
         }
@@ -248,7 +245,6 @@ impl SchemeAdvancer {
             SchemeType::ExpenseLaundering,
             self.config.expense_laundering_probability,
         );
-        draw(SchemeType::Smurfing, self.config.smurfing_probability);
         // Circular Funding, Phantom Warehousing, Intercompany Wash Trades are disabled
         // (Single-FEC scope: no multi-entity cyclical patterns).
 
@@ -326,8 +322,7 @@ impl SchemeAdvancer {
                 SchemeType::TriadBypass => Box::new(TriadBypassScheme::new(scheme_id, &perpetrator)),
                 SchemeType::ShadowPayroll => Box::new(ShadowPayrollScheme::new(scheme_id, &perpetrator)),
                 SchemeType::ExpenseLaundering => Box::new(ExpenseLaunderingScheme::new(scheme_id, &perpetrator)),
-                SchemeType::Smurfing => Box::new(SmurfingScheme::new(scheme_id, &perpetrator)),
-                // Disabled: Circular Funding, Phantom Warehousing, Intercompany Wash Trades.
+                // Disabled: Circular Funding, Phantom Warehousing, Intercompany Wash Trades. Smurfing removed.
                 SchemeType::CircularFunding
                 | SchemeType::PhantomWarehousing
                 | SchemeType::IntercompanyWashTrades => continue,
@@ -524,7 +519,6 @@ impl SchemeAdvancer {
             triad_bypass_count: by_type(SchemeType::TriadBypass),
             shadow_payroll_count: by_type(SchemeType::ShadowPayroll),
             expense_laundering_count: by_type(SchemeType::ExpenseLaundering),
-            smurfing_count: by_type(SchemeType::Smurfing),
             circular_funding_count: by_type(SchemeType::CircularFunding),
             phantom_warehousing_count: by_type(SchemeType::PhantomWarehousing),
             intercompany_wash_trade_count: by_type(SchemeType::IntercompanyWashTrades),
@@ -557,8 +551,6 @@ pub struct SchemeStatistics {
     pub shadow_payroll_count: usize,
     /// Number of expense laundering schemes.
     pub expense_laundering_count: usize,
-    /// Number of smurfing schemes.
-    pub smurfing_count: usize,
     /// Number of circular funding schemes.
     pub circular_funding_count: usize,
     /// Number of phantom warehousing schemes.

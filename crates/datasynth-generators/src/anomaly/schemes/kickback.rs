@@ -403,32 +403,52 @@ impl FraudScheme for VendorKickbackScheme {
                     self.inflated_transaction_count += 1;
                     actions.push(inv_action);
 
-                    // 2) Payment of the same inflated invoice (T+N days) → materialized as payment JE (Dr AP, Cr Bank).
-                    let payment_date = context.current_date + chrono::Duration::days(
-                        (5 + (self.inflated_transaction_count as i64) % 11).max(3), // 5–15 days
-                    );
-                    let mut pay_action = SchemeAction::new(
-                        self.scheme_id,
-                        stage.stage_number,
-                        SchemeActionType::MakeKickbackPayment,
-                        payment_date,
-                    )
-                    .with_scheme_type(self.scheme_type())
-                    .with_amount(total_amount)
-                    .with_counterparty(&self.vendor_id)
-                    .with_user(&self.perpetrator_id)
-                    .with_difficulty(stage.detection_difficulty)
-                    .with_reference(&invoice_ref)
-                    .with_description(format!(
-                        "Payment of inflated invoice {} (P2P)",
-                        invoice_ref
-                    ));
+                    // 2) Spec §4.2: Split payment into 2 or 3 separate JEs on different dates (T+10, T+15, T+20).
+                    // Same reference on all payments for partial lettrage until final payment.
+                    let num_parts = if (self.scheme_id.as_u128() + self.inflated_transaction_count as u128) % 3 == 0 {
+                        3
+                    } else {
+                        2
+                    };
+                    let parts: Vec<(i64, Decimal)> = if num_parts == 2 {
+                        let p1 = (total_amount * Decimal::new(60, 2)).round_dp(2);
+                        let p2 = total_amount - p1;
+                        vec![(10, p1), (20, p2)]
+                    } else {
+                        let third = (total_amount / Decimal::from(3u32)).round_dp(2);
+                        let two_thirds = third * Decimal::from(2u32);
+                        let remainder = total_amount - two_thirds;
+                        vec![(10, third), (15, third), (20, remainder)]
+                    };
+                    for (i, (days_offset, part_amount)) in parts.into_iter().enumerate() {
+                        if part_amount <= Decimal::ZERO {
+                            continue;
+                        }
+                        let payment_date = context.current_date + chrono::Duration::days(days_offset);
+                        let mut pay_action = SchemeAction::new(
+                            self.scheme_id,
+                            stage.stage_number,
+                            SchemeActionType::MakeKickbackPayment,
+                            payment_date,
+                        )
+                        .with_scheme_type(self.scheme_type())
+                        .with_amount(part_amount)
+                        .with_counterparty(&self.vendor_id)
+                        .with_user(&self.perpetrator_id)
+                        .with_difficulty(stage.detection_difficulty)
+                        .with_reference(&invoice_ref)
+                        .with_description(format!(
+                            "Payment {} of inflated invoice {} (P2P)",
+                            i + 1,
+                            invoice_ref
+                        ));
 
-                    for technique in &stage.concealment_techniques {
-                        pay_action = pay_action.with_technique(*technique);
+                        for technique in &stage.concealment_techniques {
+                            pay_action = pay_action.with_technique(*technique);
+                        }
+
+                        actions.push(pay_action);
                     }
-
-                    actions.push(pay_action);
                 }
             }
             2 => {

@@ -84,7 +84,6 @@ pub struct EnhancedInjectionConfig {
     pub scheme_triad_bypass_probability: Option<f64>,
     pub scheme_shadow_payroll_probability: Option<f64>,
     pub scheme_expense_laundering_probability: Option<f64>,
-    pub scheme_smurfing_probability: Option<f64>,
     pub scheme_circular_funding_probability: Option<f64>,
     pub scheme_phantom_warehousing_probability: Option<f64>,
     pub scheme_intercompany_wash_trade_probability: Option<f64>,
@@ -277,10 +276,6 @@ impl AnomalyInjector {
                 expense_laundering_probability: config
                     .enhanced
                     .scheme_expense_laundering_probability
-                    .unwrap_or(default_scheme_p),
-                smurfing_probability: config
-                    .enhanced
-                    .scheme_smurfing_probability
                     .unwrap_or(default_scheme_p),
                 circular_funding_probability: config
                     .enhanced

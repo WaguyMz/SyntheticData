@@ -8007,10 +8007,6 @@ pub struct MultiStageSchemeConfig {
     #[serde(default)]
     pub expense_laundering: SchemeProbabilityOnlyConfig,
 
-    /// Smurfing (threshold evasion via many small payments) scheme probability.
-    #[serde(default)]
-    pub smurfing: SchemeProbabilityOnlyConfig,
-
     /// Circular funding (round-tripping A→B→C→A) scheme probability.
     #[serde(default)]
     pub circular_funding: SchemeProbabilityOnlyConfig,

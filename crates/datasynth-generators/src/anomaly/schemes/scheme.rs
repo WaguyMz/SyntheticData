@@ -126,6 +126,10 @@ pub struct SchemeContext {
     pub available_users: Vec<String>,
     /// Company code.
     pub company_code: String,
+    /// Optional annual revenue for amount scaling (e.g. expense laundering).
+    pub annual_revenue: Option<Decimal>,
+    /// Candidate invoice refs for triad bypass ("document_id|vendor_id").
+    pub candidate_invoice_ids: Vec<String>,
 }
 
 impl SchemeContext {
@@ -139,6 +143,8 @@ impl SchemeContext {
             available_counterparties: Vec::new(),
             available_users: Vec::new(),
             company_code: company_code.into(),
+            annual_revenue: None,
+            candidate_invoice_ids: Vec::new(),
         }
     }
 
@@ -169,6 +175,18 @@ impl SchemeContext {
     /// Sets available users.
     pub fn with_users(mut self, users: Vec<String>) -> Self {
         self.available_users = users;
+        self
+    }
+
+    /// Sets annual revenue for amount scaling.
+    pub fn with_annual_revenue(mut self, revenue: Decimal) -> Self {
+        self.annual_revenue = Some(revenue);
+        self
+    }
+
+    /// Sets candidate invoice refs ("document_id|vendor_id") for triad bypass.
+    pub fn with_candidate_invoices(mut self, ids: Vec<String>) -> Self {
+        self.candidate_invoice_ids = ids;
         self
     }
 }
@@ -373,6 +391,27 @@ pub enum SchemeActionType {
     IntercompanyRoundTrip,
     /// Transfer inventory to ghost location.
     InventoryTransferToGhostLocation,
+    // Expense laundering
+    /// Stage expense to suspense (Dr Expense + VAT, Cr 471000).
+    SuspenseStaging,
+    /// Clear suspense to AP (Dr 471000, Cr AP).
+    SuspenseClearance,
+    /// Settle shell vendor (payment).
+    ShellVendorSettlement,
+    /// Consolidation wire aggregating shell proceeds.
+    ConsolidationWire,
+    // Shadow payroll
+    /// Ghost hire admin (no financial JE).
+    GhostHire,
+    /// Monthly payroll run.
+    MonthlyPayroll,
+    /// Ghost termination admin (no financial JE).
+    GhostTermination,
+    /// Final settlement (last payroll / severance).
+    FinalSettlement,
+    // Triad bypass
+    /// Concealment correcting reversals.
+    BypassConcealment,
 }
 
 /// Trait for fraud schemes.

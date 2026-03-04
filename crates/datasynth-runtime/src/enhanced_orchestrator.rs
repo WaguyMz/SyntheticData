@@ -6405,7 +6405,6 @@ impl EnhancedOrchestrator {
             scheme_triad_bypass_probability: Some(schemes.triad_bypass.probability),
             scheme_shadow_payroll_probability: Some(schemes.shadow_payroll.probability),
             scheme_expense_laundering_probability: Some(schemes.expense_laundering.probability),
-            scheme_smurfing_probability: Some(schemes.smurfing.probability),
             scheme_circular_funding_probability: Some(schemes.circular_funding.probability),
             scheme_phantom_warehousing_probability: Some(schemes.phantom_warehousing.probability),
             scheme_intercompany_wash_trade_probability: Some(schemes.intercompany_wash_trade.probability),
@@ -6441,7 +6440,7 @@ impl EnhancedOrchestrator {
         // rather than only on days that have journal entries. This gives schemes enough
         // consecutive "days" to progress through stages and emit actions/labels.
         if schemes.enabled && !entries.is_empty() {
-            use std::collections::{BTreeSet, HashMap, HashSet};
+            use std::collections::{BTreeSet, HashSet};
             let companies: Vec<String> = entries
                 .iter()
                 .map(|e| e.header.company_code.clone())
@@ -6504,7 +6503,6 @@ impl EnhancedOrchestrator {
                 + schemes.triad_bypass.probability
                 + schemes.shadow_payroll.probability
                 + schemes.expense_laundering.probability
-                + schemes.smurfing.probability
                 + schemes.circular_funding.probability
                 + schemes.phantom_warehousing.probability
                 + schemes.intercompany_wash_trade.probability;
@@ -6909,7 +6907,21 @@ impl EnhancedOrchestrator {
                 }
                 // Triad bypass (process bypass): Dr 401000, Cr 512000; Compte aux. on AP.
                 SchemeActionType::ReuseDocumentId => (ap.as_str(), bank.as_str()),
-                SchemeActionType::Conceal | SchemeActionType::CoverUp => {
+                // Expense laundering
+                SchemeActionType::SuspenseStaging | SchemeActionType::SuspenseClearance
+                | SchemeActionType::ShellVendorSettlement | SchemeActionType::ConsolidationWire => {
+                    (expense_laundering_debit.as_str(), ap.as_str())
+                }
+                // Shadow payroll
+                SchemeActionType::GhostHire | SchemeActionType::GhostTermination => {
+                    (default_debit, default_credit)
+                }
+                SchemeActionType::MonthlyPayroll | SchemeActionType::FinalSettlement => {
+                    (salaries_wages.as_str(), wages_payable.as_str())
+                }
+                SchemeActionType::BypassConcealment
+                | SchemeActionType::Conceal
+                | SchemeActionType::CoverUp => {
                     let debit = default_debit;
                     let credit = if debit == default_credit {
                         preferred
@@ -7222,6 +7234,80 @@ impl EnhancedOrchestrator {
                     );
                     entry.add_line(with_aux(line_ap, &ap));
                 }
+                // Expense laundering §7.1 Step 1 (SuspenseStaging): Dr 628000 (net), Dr 445660 (VAT), Cr 471000.
+                SchemeActionType::SuspenseStaging => {
+                    if is_pcg {
+                        let one_point_two = Decimal::new(120, 2);
+                        let net = amount / one_point_two;
+                        let vat = amount - net;
+                        let mut line_no = 1u32;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::expense_accounts::MISC_SERVICES.to_string(),
+                            net,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::tax_accounts::INPUT_VAT.to_string(),
+                            vat,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::suspense_accounts::GENERAL_SUSPENSE.to_string(),
+                            amount,
+                        ));
+                    } else {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            debit_acct.to_string(),
+                            amount,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            credit_acct.to_string(),
+                            amount,
+                        ));
+                    }
+                }
+                // Expense laundering §7.1 Step 2 (SuspenseClearance): Dr 471000, Cr 401000 (2 days later).
+                SchemeActionType::SuspenseClearance => {
+                    if is_pcg {
+                        let line_dr = JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            pcg::suspense_accounts::GENERAL_SUSPENSE.to_string(),
+                            amount,
+                        );
+                        entry.add_line(line_dr);
+                        let line_ap = JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            ap.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, &ap));
+                    } else {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            debit_acct.to_string(),
+                            amount,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            credit_acct.to_string(),
+                            amount,
+                        ));
+                    }
+                }
                 // Revenue manipulation (all four stages). PCG: Dr 411000 + Dr 418100 (invoices to be issued), Cr 701000.
                 SchemeActionType::ManipulateRevenue
                 | SchemeActionType::DeferExpense
@@ -7268,7 +7354,8 @@ impl EnhancedOrchestrator {
                 // Ghost employee. PCG: Dr 641100 (gross) + Dr 645100 (URSSAF 20%), Cr 421000 (gross+social).
                 SchemeActionType::CreateGhostEmployee => {
                     if is_pcg {
-                        let social = amount * Decimal::new(2, 1); // 20%
+                        // Spec §6.2: 645100 = Salary * 0.42, Cr 421000 = Salary * 1.42.
+                        let social = amount * Decimal::new(42, 2); // 0.42
                         let total = amount + social;
                         let mut line_no = 1;
                         entry.add_line(JournalEntryLine::debit(
@@ -7358,8 +7445,8 @@ impl EnhancedOrchestrator {
                         ));
                     } else if is_pcg && action.scheme_type == Some(SchemeType::ShadowPayroll) {
                         // Shadow payroll (ghost employee) in PCG: include employer social charges.
-                        // Treat action.amount as gross salary; approximate employer charges at 40% of gross.
-                        let employer_rate = Decimal::new(40, 2); // 0.40
+                        // Spec: 645100 (Cotisations) = Salary * 0.42, Cr 421000 = Salary * 1.42.
+                        let employer_rate = Decimal::new(42, 2); // 0.42
                         let employer_social = amount * employer_rate;
                         let total_credit = amount + employer_social;
                         let mut line_no = 1;
@@ -7406,44 +7493,6 @@ impl EnhancedOrchestrator {
                             credit_acct.to_string(),
                             amount,
                         ));
-                    }
-                }
-                // Payment-type scheme actions: optionally split into multiple smaller payments
-                // within the same document to mimic multipayment behavior.
-                SchemeActionType::CreateFraudulentPayment
-                | SchemeActionType::MakeKickbackPayment => {
-                    // Deterministic "random" split based on action_id.
-                    let hash = action.action_id.as_u128() % 10;
-                    let parts = if hash < 3 {
-                        // 30% of cases → three-way split
-                        let third = (amount / Decimal::from(3u32)).round_dp(2);
-                        let two_thirds = (third * Decimal::from(2u32)).round_dp(2);
-                        vec![third, third, amount - two_thirds]
-                    } else if hash < 6 {
-                        // 30% of cases → two-way split
-                        let half = (amount / Decimal::from(2u32)).round_dp(2);
-                        vec![half, amount - half]
-                    } else {
-                        // 40% of cases → single payment (no split)
-                        vec![amount]
-                    };
-
-                    let mut line_no = 1;
-                    for part in parts {
-                        entry.add_line(JournalEntryLine::debit(
-                            action.scheme_id,
-                            line_no,
-                            debit_acct.to_string(),
-                            part,
-                        ));
-                        line_no += 1;
-                        entry.add_line(JournalEntryLine::credit(
-                            action.scheme_id,
-                            line_no,
-                            credit_acct.to_string(),
-                            part,
-                        ));
-                        line_no += 1;
                     }
                 }
                 // Default: a simple 2-line balanced entry (generic accounts).
