@@ -1,0 +1,580 @@
+.fraud-anomaly-view {
+  padding: 1rem 0;
+}
+
+.fraud-anomaly-view.loading,
+.fraud-anomaly-view.error {
+  padding: 2rem;
+  text-align: center;
+  color: var(--muted, #888);
+}
+
+.fraud-anomaly-view.error {
+  color: var(--error, #c55);
+}
+
+.fraud-anomaly-view h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.35rem;
+}
+
+.fraud-anomaly-view h3 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.fraud-anomaly-desc {
+  margin-bottom: 1rem;
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+}
+
+.fraud-anomaly-desc code {
+  background: var(--code-bg, #2a2a2a);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.fraud-anomaly-involved-entities {
+  margin-bottom: 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+}
+
+.fraud-anomaly-involved-dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1.5rem;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.fraud-anomaly-involved-dl dt {
+  margin: 0;
+  font-weight: 600;
+  color: var(--muted, #888);
+}
+
+.fraud-anomaly-involved-dl dd {
+  margin: 0;
+}
+
+.fraud-anomaly-involved-dl dd code {
+  background: var(--code-bg, #1e1e1e);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+
+.fraud-anomaly-empty {
+  color: var(--muted, #888);
+  padding: 2rem;
+}
+
+.fraud-anomaly-filter {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.fraud-anomaly-filter label {
+  font-weight: 500;
+}
+
+.fraud-anomaly-filter select {
+  min-width: 180px;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #2a2a2a);
+  color: inherit;
+}
+
+.fraud-anomaly-filter-count {
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+}
+
+.fraud-anomaly-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.chart-box {
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+  padding: 1rem;
+  min-height: 320px;
+}
+
+.chart-box-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.chart-box-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.chart-expand-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  background: var(--bg-tertiary, #1a1a1a);
+  color: var(--muted, #888);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.chart-expand-btn:hover {
+  color: var(--text, #eee);
+  background: var(--bg-secondary, #333);
+  border-color: var(--muted, #666);
+}
+
+.chart-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
+}
+
+.chart-modal {
+  background: var(--bg-primary, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  width: min(90vw, 720px);
+  min-width: 480px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chart-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border-color, #444);
+}
+
+.chart-modal-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.chart-modal-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted, #888);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.chart-modal-close:hover {
+  color: var(--text, #eee);
+  background: var(--bg-secondary, #333);
+}
+
+.chart-modal-body {
+  padding: 1.25rem;
+  min-height: 400px;
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.fraud-anomaly-concerned {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  background: var(--bg-secondary, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+}
+
+.fraud-anomaly-concerned h3 {
+  margin: 0 0 0.5rem;
+}
+
+.fraud-anomaly-concerned-desc {
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.fraud-anomaly-concerned-desc code {
+  background: var(--code-bg, #2a2a2a);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.fraud-anomaly-concerned-empty {
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+}
+
+.fraud-anomaly-concerned-hint {
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  margin-top: 0.5rem;
+}
+
+.fraud-anomaly-concerned-chart {
+  margin-bottom: 1rem;
+  min-height: 220px;
+}
+
+/* Scheme column: badge-style for multi-stage scheme anomalies */
+.fraud-anomaly-view .data-table td:nth-child(4) {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--scheme-accent, #9b59b6);
+}
+.fraud-anomaly-view .data-table td:nth-child(4):not(:empty) {
+  background: color-mix(in srgb, var(--scheme-accent, #9b59b6) 18%, transparent);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  width: 1%;
+  white-space: nowrap;
+}
+
+/* Scheme taxonomy (10 types) */
+.scheme-taxonomy {
+  margin-bottom: 1.5rem;
+}
+
+.scheme-taxonomy h3 {
+  margin: 0 0 0.25rem;
+}
+
+.scheme-taxonomy-hint {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted, #888);
+}
+
+.scheme-taxonomy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
+}
+
+.scheme-taxonomy-card {
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  border-left-width: 4px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.scheme-taxonomy-card:hover {
+  background: var(--bg-hover, #333);
+}
+
+.scheme-taxonomy-card:focus-visible {
+  outline: 2px solid var(--focus-color, #4a7cff);
+  outline-offset: 2px;
+}
+
+.scheme-taxonomy-card--selected {
+  box-shadow: 0 0 0 2px var(--focus-color, #4a7cff);
+  background: var(--bg-selected, #1a2a4a);
+}
+
+.scheme-taxonomy-card[data-category="Sequential"] {
+  border-left-color: #3498db;
+}
+
+.scheme-taxonomy-card[data-category="Volume"] {
+  border-left-color: #e67e22;
+}
+
+.scheme-taxonomy-card[data-category="Relational"] {
+  border-left-color: #9b59b6;
+}
+
+.scheme-taxonomy-filter-active {
+  margin-top: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.scheme-taxonomy-filter-active strong {
+  color: var(--text-primary, #eee);
+}
+
+.scheme-taxonomy-clear {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  color: var(--text-primary, #eee);
+  cursor: pointer;
+}
+
+.scheme-taxonomy-clear:hover {
+  background: var(--bg-hover, #333);
+}
+
+.scheme-taxonomy-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  display: block;
+}
+
+.scheme-taxonomy-cat {
+  font-size: 0.75rem;
+  color: var(--muted, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.scheme-taxonomy-desc {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+  line-height: 1.3;
+}
+
+/* Scheme instances */
+.scheme-instances {
+  margin-bottom: 1.5rem;
+}
+
+.scheme-instances h3 {
+  margin: 0 0 0.5rem;
+}
+
+.scheme-instances-desc {
+  color: var(--muted, #888);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.scheme-instances-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.scheme-instance-card {
+  padding: 1rem;
+  background: var(--bg-secondary, #2a2a2a);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.scheme-instance-card:hover {
+  border-color: var(--muted, #666);
+}
+
+.scheme-instance-card.selected {
+  border-color: var(--scheme-accent, #9b59b6);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--scheme-accent, #9b59b6) 30%, transparent);
+}
+
+.scheme-instance-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
+.scheme-instance-id {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+}
+
+.scheme-instance-cat {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.scheme-instance-cat[data-category="Sequential"] {
+  color: #3498db;
+}
+
+.scheme-instance-cat[data-category="Volume"] {
+  color: #e67e22;
+}
+
+.scheme-instance-cat[data-category="Relational"] {
+  color: #9b59b6;
+}
+
+.scheme-instance-name {
+  font-weight: 600;
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.scheme-instance-details {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  font-size: 0.85rem;
+  margin: 0 0 0.75rem;
+}
+
+.scheme-instance-details dt {
+  color: var(--muted, #888);
+  font-weight: 500;
+}
+
+.scheme-instance-details dd {
+  margin: 0;
+}
+
+.scheme-instance-graph-btn {
+  width: 100%;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  background: var(--bg-tertiary, #1a1a1a);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.scheme-instance-graph-btn:hover {
+  background: var(--bg-secondary, #333);
+  border-color: var(--muted, #666);
+}
+
+.scheme-instance-graph-panel {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: var(--bg-secondary, #252525);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 8px;
+}
+
+.scheme-instance-graph-panel h4 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.scheme-instance-graph-desc {
+  color: var(--muted, #888);
+  font-size: 0.85rem;
+  margin-bottom: 0.75rem;
+}
+
+.scheme-instance-graph-container {
+  width: 100%;
+  height: 320px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-primary, #1e1e1e);
+}
+
+@media (prefers-color-scheme: light) {
+  .chart-box {
+    background: #f8f8f8;
+    border-color: #ddd;
+  }
+  .chart-expand-btn {
+    background: #eee;
+    border-color: #ccc;
+    color: #555;
+  }
+  .chart-expand-btn:hover {
+    background: #e0e0e0;
+    color: #333;
+    border-color: #999;
+  }
+  .chart-modal {
+    background: #fff;
+    border-color: #ddd;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+  }
+  .chart-modal-header {
+    border-bottom-color: #ddd;
+  }
+  .chart-modal-close {
+    color: #666;
+  }
+  .chart-modal-close:hover {
+    color: #333;
+    background: #eee;
+  }
+  .fraud-anomaly-concerned {
+    background: #f5f5f5;
+    border-color: #ddd;
+  }
+  .scheme-taxonomy-card {
+    background: #f5f5f5;
+    border-color: #ddd;
+  }
+  .scheme-instance-card {
+    background: #f8f8f8;
+    border-color: #ddd;
+  }
+  .scheme-instance-card.selected {
+    border-color: #9b59b6;
+    box-shadow: 0 0 0 2px rgba(155, 89, 182, 0.25);
+  }
+  .scheme-instance-graph-panel {
+    background: #f0f0f0;
+    border-color: #ddd;
+  }
+  .scheme-instance-graph-container {
+    background: #fff;
+  }
+}
