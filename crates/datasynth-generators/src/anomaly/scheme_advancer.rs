@@ -56,6 +56,13 @@ pub struct SchemeAdvancerConfig {
     /// Vendor typical order amount range when no prior inflated base is recorded.
     pub kickback_vendor_typical_amount_min: f64,
     pub kickback_vendor_typical_amount_max: f64,
+    /// Kickback scheme stage durations (fewer months = shorter schemes, fewer JEs).
+    pub kickback_setup_months: u32,
+    pub kickback_operation_months: u32,
+    pub kickback_payments_months: u32,
+    pub kickback_concealment_months: u32,
+    /// Probability per advance to emit one inflated invoice in operation stage. Lower = fewer JEs per scheme.
+    pub kickback_inflation_action_probability: f64,
     /// Probability of starting a triad bypass scheme per period.
     pub triad_bypass_probability: f64,
     /// Probability of starting a shadow payroll scheme per period.
@@ -85,6 +92,11 @@ impl Default for SchemeAdvancerConfig {
             kickback_amount_shift_percent: 0.15,
             kickback_vendor_typical_amount_min: 5_000.0,
             kickback_vendor_typical_amount_max: 50_000.0,
+            kickback_setup_months: 3,
+            kickback_operation_months: 6,
+            kickback_payments_months: 4,
+            kickback_concealment_months: 2,
+            kickback_inflation_action_probability: 0.08,
             triad_bypass_probability: 0.005,
             shadow_payroll_probability: 0.005,
             expense_laundering_probability: 0.005,
@@ -159,6 +171,9 @@ pub struct MultiStageAnomalyLabel {
     /// Action amount if applicable (for display in viewer).
     #[serde(default)]
     pub action_amount: Option<rust_decimal::Decimal>,
+    /// Reference (e.g. reused invoice ID for triad bypass) for display in viewer.
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 /// Manages the lifecycle of multiple fraud schemes.
@@ -315,7 +330,14 @@ impl SchemeAdvancer {
                         .with_vendor_typical_range(
                             self.config.kickback_vendor_typical_amount_min,
                             self.config.kickback_vendor_typical_amount_max,
-                        );
+                        )
+                        .with_stage_durations(
+                            self.config.kickback_setup_months,
+                            self.config.kickback_operation_months,
+                            self.config.kickback_payments_months,
+                            self.config.kickback_concealment_months,
+                        )
+                        .with_inflation_action_probability(self.config.kickback_inflation_action_probability);
                     self.active_vendors.push(vendor);
                     Box::new(s)
                 }
@@ -423,6 +445,7 @@ impl SchemeAdvancer {
                 anomaly_date: Some(action.target_date),
                 counterparty: action.counterparty.clone(),
                 action_amount: action.amount,
+                reference: action.reference.clone(),
             };
             self.labels.push(label);
         }

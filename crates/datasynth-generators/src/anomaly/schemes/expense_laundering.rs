@@ -122,17 +122,19 @@ impl ExpenseLaunderingScheme {
         }
     }
 
-    /// Computes a micro-expense amount based on annual revenue scaling.
-    ///
-    /// `base_max = max(50.0, annual_revenue / 100_000.0)`
-    /// Amount ∈ [base_max × 0.01, base_max × 0.10]
+    /// Computes a micro-expense amount. When fingerprint configs exist, samples from 6XXX
+    /// and scales by 0.01–0.10 so micro amounts stay in-distribution (not easy outliers).
+    /// Otherwise uses annual revenue scaling: base_max = max(50, annual_revenue/100k), amount ∈ [base_max×0.01, base_max×0.10].
     fn sample_micro_amount(&self, context: &SchemeContext, rng: &mut dyn rand::RngCore) -> Decimal {
+        if let Some(base) = context.sample_amount_from_fingerprint(rng, Some("6XXX")) {
+            let factor = Decimal::from_f64_retain(rng.random_range(0.01..=0.10)).unwrap_or(dec!(0.05));
+            return (base * factor).round_dp(2).max(dec!(1));
+        }
         let base_max: f64 = context
             .annual_revenue
             .and_then(|r: Decimal| r.try_into().ok())
             .map(|r: f64| (r / 100_000.0_f64).max(50.0))
             .unwrap_or(50.0);
-
         let lo = base_max * 0.01;
         let hi = base_max * 0.10;
         let v = rng.random_range(lo..=hi);
@@ -350,7 +352,10 @@ impl FraudScheme for ExpenseLaunderingScheme {
             2 => {
                 if !self.settlement_emitted {
                     for vendor_id in &self.shell_vendors.clone() {
-                        let settle_amount = stage.random_amount(rng);
+                        // Use fingerprint distribution so settlement amounts are in-distribution (not easy outliers)
+                        let settle_amount = context
+                            .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                            .unwrap_or_else(|| stage.random_amount(rng));
                         let action = SchemeAction::new(
                             self.scheme_id,
                             stage.stage_number,
@@ -371,7 +376,11 @@ impl FraudScheme for ExpenseLaunderingScheme {
                     }
 
                     // Single ConsolidationWire aggregating all shell proceeds
-                    let wire_amount = self.total_impact.max(stage.random_amount(rng));
+                    let wire_candidate = context
+                        // Use fingerprint distribution so wire amounts are in-distribution (not easy outliers)
+                        .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                        .unwrap_or_else(|| stage.random_amount(rng));
+                    let wire_amount = self.total_impact.max(wire_candidate);
                     let wire_action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,

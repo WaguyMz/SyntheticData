@@ -239,7 +239,10 @@ impl FraudScheme for TriadBypassScheme {
                     self.reuses_this_month = 0;
                     // Emit all reuses for this month on first advance of the month
                     for _ in 0..target {
-                        let amount = stage.random_amount(rng);
+                        let amount = context
+                            // Use fingerprint distribution so payment amounts are in-distribution (not easy outliers)
+                            .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                            .unwrap_or_else(|| stage.random_amount(rng));
                         let mut action = SchemeAction::new(
                             self.scheme_id,
                             stage.stage_number,
@@ -283,7 +286,10 @@ impl FraudScheme for TriadBypassScheme {
             // Stage 2: concealment — BypassConcealment correcting reversals
             2 => {
                 if self.days_since_last_transaction >= 3 && rng.random::<f64>() < 0.30 {
-                    let amount = stage.random_amount(rng);
+                    // Use fingerprint distribution so concealment amounts are in-distribution (not easy outliers)
+                    let amount = context
+                        .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                        .unwrap_or_else(|| stage.random_amount(rng));
                     let mut action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,

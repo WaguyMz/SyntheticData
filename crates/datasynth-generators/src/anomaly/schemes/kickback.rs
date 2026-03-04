@@ -69,6 +69,8 @@ pub struct VendorKickbackScheme {
     legitimate_transaction_count: u32,
     /// Inflated transaction count.
     inflated_transaction_count: u32,
+    /// Probability per advance to emit one inflated-invoice action in the operation stage (configurable for shorter schemes).
+    inflation_action_probability: f64,
 }
 
 impl VendorKickbackScheme {
@@ -149,7 +151,31 @@ impl VendorKickbackScheme {
             vendor_typical_amount_max: dec!(50000),
             legitimate_transaction_count: 0,
             inflated_transaction_count: 0,
+            inflation_action_probability: 0.2,
         }
+    }
+
+    /// Sets stage durations from config (shorter values = fewer JEs per scheme).
+    pub fn with_stage_durations(
+        mut self,
+        setup_months: u32,
+        operation_months: u32,
+        kickback_payments_months: u32,
+        concealment_months: u32,
+    ) -> Self {
+        if self.stages.len() >= 4 {
+            self.stages[0].duration_months = setup_months;
+            self.stages[1].duration_months = operation_months;
+            self.stages[2].duration_months = kickback_payments_months;
+            self.stages[3].duration_months = concealment_months;
+        }
+        self
+    }
+
+    /// Sets the probability per advance to emit one inflated invoice in the operation stage (lower = fewer JEs).
+    pub fn with_inflation_action_probability(mut self, p: f64) -> Self {
+        self.inflation_action_probability = p.clamp(0.01, 1.0);
+        self
     }
 
     /// Sets the inflation percentage (0.10 to 0.25).
@@ -363,8 +389,11 @@ impl FraudScheme for VendorKickbackScheme {
             1 => {
                 // Price inflation stage — full P2P cycle: inflated invoice (billing) + payment with VAT.
                 // Base amount = vendor's "usual" order; total_amount = inflated gross (what company pays).
-                if rng.random::<f64>() < 0.2 {
-                    let base_amount = stage.random_amount(rng);
+                if rng.random::<f64>() < self.inflation_action_probability {
+                    // Use fingerprint distribution so inflated amounts stay in-distribution (not easy outliers)
+                    let base_amount = context
+                        .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                        .unwrap_or_else(|| stage.random_amount(rng));
                     let inflation = self.calculate_inflation(base_amount);
                     let total_amount = base_amount + inflation;
 

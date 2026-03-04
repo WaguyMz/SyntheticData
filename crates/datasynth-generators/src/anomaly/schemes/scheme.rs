@@ -130,6 +130,8 @@ pub struct SchemeContext {
     pub annual_revenue: Option<Decimal>,
     /// Candidate invoice refs for triad bypass ("document_id|vendor_id").
     pub candidate_invoice_ids: Vec<String>,
+    /// Per-account-class amount configs from fingerprint so fraud amounts stay in-distribution (not easy outliers).
+    pub fingerprint_amount_configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
 }
 
 impl SchemeContext {
@@ -145,6 +147,7 @@ impl SchemeContext {
             company_code: company_code.into(),
             annual_revenue: None,
             candidate_invoice_ids: Vec::new(),
+            fingerprint_amount_configs: None,
         }
     }
 
@@ -188,6 +191,31 @@ impl SchemeContext {
     pub fn with_candidate_invoices(mut self, ids: Vec<String>) -> Self {
         self.candidate_invoice_ids = ids;
         self
+    }
+
+    /// Sets per-class amount configs from fingerprint so scheme amounts are in-distribution (fraud not obvious outliers).
+    pub fn with_fingerprint_amount_configs(
+        mut self,
+        configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
+    ) -> Self {
+        self.fingerprint_amount_configs = configs;
+        self
+    }
+
+    /// Sample an amount from fingerprint-derived distribution for the given account class when available.
+    /// Returns None if no fingerprint config; schemes then fall back to stage.random_amount().
+    /// This keeps fraud amounts in-distribution so they are not trivial outliers.
+    pub fn sample_amount_from_fingerprint<R: Rng + ?Sized>(
+        &self,
+        rng: &mut R,
+        class: Option<&str>,
+    ) -> Option<Decimal> {
+        let configs = self.fingerprint_amount_configs.as_ref()?;
+        let config = class
+            .and_then(|c| configs.get(c))
+            .or_else(|| configs.get("6XXX").or_else(|| configs.values().next()))?;
+        let seed: u64 = rng.random();
+        Some(datasynth_core::AmountSampler::with_config(seed, config.clone()).sample())
     }
 }
 

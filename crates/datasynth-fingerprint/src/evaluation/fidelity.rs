@@ -5,8 +5,71 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::error::FingerprintResult;
+
+/// Map column name to a canonical semantic key so that e.g. "Debit", "debit_amount",
+/// "Montant au débit" all match for statistical comparison across different schemas
+/// (source FEC/APRR vs datasynth journal_entries.csv).
+fn canonical_column_key(name: &str) -> String {
+    let lower = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'é' | 'è' | 'ê' => 'e',
+            'à' | 'â' => 'a',
+            'ù' | 'û' => 'u',
+            'î' | 'ï' => 'i',
+            'ô' => 'o',
+            'ç' => 'c',
+            _ => c,
+        })
+        .collect::<String>();
+    if lower.contains("debit") {
+        return "debit".to_string();
+    }
+    if lower.contains("credit") {
+        return "credit".to_string();
+    }
+    if (lower.contains("compte") && !lower.contains("lib"))
+        || lower == "gl_account"
+        || lower == "account_number"
+        || lower.contains("account")
+        || lower.contains("konto")
+        || lower.contains("numero_compte")
+    {
+        return "account".to_string();
+    }
+    if lower.contains("montant") && lower.contains("debit") {
+        return "debit".to_string();
+    }
+    if lower.contains("montant") && lower.contains("credit") {
+        return "credit".to_string();
+    }
+    lower
+}
 use crate::extraction::{DataSource, FingerprintExtractor};
 use crate::models::{Fingerprint, NumericStats, StatisticsFingerprint};
+use crate::models::DistributionType;
+
+/// Derive log-normal (μ, σ) from NumericStats. Uses stored params if LogNormal, else method of moments.
+fn lognormal_params_from_stats(s: &NumericStats) -> Option<(f64, f64)> {
+    if s.mean <= 0.0 {
+        return None;
+    }
+    let variance = s.std_dev * s.std_dev;
+    if let (DistributionType::LogNormal, Some(mu), Some(sigma)) = (
+        s.distribution,
+        s.distribution_params.param1,
+        s.distribution_params.param2,
+    ) {
+        if sigma > 0.0 {
+            return Some((mu, sigma));
+        }
+    }
+    let sigma_sq = (1.0 + variance / s.mean.powi(2)).ln();
+    let mu = s.mean.ln() - sigma_sq / 2.0;
+    Some((mu, sigma_sq.sqrt()))
+}
 
 /// Configuration for fidelity evaluation.
 #[derive(Debug, Clone)]
@@ -72,6 +135,8 @@ pub struct FidelityDetails {
     pub js_divergences: HashMap<String, f64>,
     /// Benford's Law MAD.
     pub benford_mad: Option<f64>,
+    /// Account-class proportion MAD (mean absolute difference in class mix).
+    pub account_class_proportion_mad: Option<f64>,
     /// Correlation matrix RMSE.
     pub correlation_rmse: Option<f64>,
     /// Row count ratio (synthetic / fingerprint).
@@ -233,70 +298,98 @@ impl FidelityEvaluator {
             })
             .collect();
 
+        // Build a lookup by canonical semantic key so that e.g. Debit <-> debit_amount match
+        // (original fingerprint from FEC/APRR vs synthetic journal_entries.csv)
+        let syn_numeric_by_canonical: HashMap<String, (&str, &NumericStats)> = synthetic
+            .numeric_columns
+            .iter()
+            .map(|(k, v)| {
+                let stripped = k.split('.').next_back().unwrap_or(k);
+                (canonical_column_key(stripped), (k.as_str(), v))
+            })
+            .collect();
+
         let syn_categorical_keys: std::collections::HashSet<String> = synthetic
             .categorical_columns
             .keys()
             .map(|k| k.split('.').next_back().unwrap_or(k).to_string())
             .collect();
 
+        let syn_categorical_by_canonical: std::collections::HashSet<String> = synthetic
+            .categorical_columns
+            .keys()
+            .map(|k| {
+                let stripped = k.split('.').next_back().unwrap_or(k);
+                canonical_column_key(stripped)
+            })
+            .collect();
+
         // Compare numeric columns
         for (col_name, orig_stats) in &original.numeric_columns {
             let stripped = col_name.split('.').next_back().unwrap_or(col_name);
+            let canonical = canonical_column_key(stripped);
 
-            // First try exact match
-            if let Some(syn_stats) = synthetic.numeric_columns.get(col_name) {
-                matched_numeric += 1;
-                let metrics = self.compare_numeric_stats(col_name, orig_stats, syn_stats);
-                let col_score = 1.0
-                    - (metrics.ks_statistic
-                        + metrics.mean_diff.abs().min(1.0)
-                        + metrics.std_dev_diff.abs().min(1.0))
-                        / 3.0;
-                scores.push(col_score.max(0.0));
-                details
-                    .ks_statistics
-                    .insert(col_name.clone(), metrics.ks_statistic);
-                details
-                    .wasserstein_distances
-                    .insert(col_name.clone(), metrics.wasserstein_distance);
-                details
-                    .js_divergences
-                    .insert(col_name.clone(), metrics.js_divergence);
-                details.column_metrics.insert(col_name.clone(), metrics);
+            let (syn_name, syn_stats) = if let Some(syn_stats) = synthetic.numeric_columns.get(col_name) {
+                (col_name.as_str(), syn_stats)
             } else if let Some((_syn_key, syn_stats)) = syn_numeric_by_stripped.get(stripped) {
-                // Match by stripped column name (different table prefix)
-                matched_numeric += 1;
-                let metrics = self.compare_numeric_stats(stripped, orig_stats, syn_stats);
-                let col_score = 1.0
+                (stripped, *syn_stats)
+            } else if let Some((_syn_key, syn_stats)) = syn_numeric_by_canonical.get(&canonical) {
+                (stripped, *syn_stats)
+            } else {
+                continue;
+            };
+
+            matched_numeric += 1;
+            let metrics = self.compare_numeric_stats(syn_name, orig_stats, syn_stats);
+            // Account-like columns (CompteNum, gl_account): mean/std are meaningless; use only shape (KS)
+            let col_score = if canonical == "account" {
+                (1.0 - metrics.ks_statistic).max(0.0)
+            } else {
+                (1.0
                     - (metrics.ks_statistic
-                        + metrics.mean_diff.abs().min(1.0)
-                        + metrics.std_dev_diff.abs().min(1.0))
-                        / 3.0;
-                scores.push(col_score.max(0.0));
-                details
-                    .ks_statistics
-                    .insert(col_name.clone(), metrics.ks_statistic);
-                details
-                    .wasserstein_distances
-                    .insert(col_name.clone(), metrics.wasserstein_distance);
-                details
-                    .js_divergences
-                    .insert(col_name.clone(), metrics.js_divergence);
-                details.column_metrics.insert(col_name.clone(), metrics);
-            }
+                        + metrics.mean_diff.min(1.0)
+                        + metrics.std_dev_diff.min(1.0))
+                        / 3.0)
+                    .max(0.0)
+            };
+            scores.push(col_score);
+            details
+                .ks_statistics
+                .insert(col_name.clone(), metrics.ks_statistic);
+            details
+                .wasserstein_distances
+                .insert(col_name.clone(), metrics.wasserstein_distance);
+            details
+                .js_divergences
+                .insert(col_name.clone(), metrics.js_divergence);
+            details.column_metrics.insert(col_name.clone(), metrics);
         }
 
-        // Compare categorical columns
+        // Compare categorical columns (including by canonical key)
         for col_name in original.categorical_columns.keys() {
             let stripped = col_name.split('.').next_back().unwrap_or(col_name);
+            let canonical = canonical_column_key(stripped);
             if synthetic.categorical_columns.contains_key(col_name)
                 || syn_categorical_keys.contains(stripped)
+                || syn_categorical_by_canonical.contains(&canonical)
             {
                 matched_categorical += 1;
             }
         }
 
-        // Compare Benford's Law if available
+        // When both have account-class stats: statistical fidelity = average class-level similarity
+        if !original.account_class_stats.is_empty() && !synthetic.account_class_stats.is_empty() {
+            let avg_class_similarity =
+                self.compute_average_class_level_similarity(original, synthetic);
+            if avg_class_similarity.is_finite() && avg_class_similarity >= 0.0 {
+                details.account_class_proportion_mad = Some(
+                    evaluate_account_class_fidelity(original, synthetic).0,
+                );
+                return avg_class_similarity.min(1.0);
+            }
+        }
+
+        // Fallback: compare Benford, proportions, per-class amount, and global columns
         if let (Some(orig_benford), Some(syn_benford)) =
             (&original.benford_analysis, &synthetic.benford_analysis)
         {
@@ -305,8 +398,16 @@ impl FidelityEvaluator {
                 &syn_benford.observed_frequencies,
             );
             details.benford_mad = Some(benford_mad);
-            scores.push(1.0 - benford_mad.min(0.1) * 10.0); // Scale MAD to score
+            scores.push(1.0 - benford_mad.min(0.1) * 10.0);
         }
+
+        if !original.account_class_stats.is_empty() {
+            let (mad, class_score) = evaluate_account_class_fidelity(original, synthetic);
+            details.account_class_proportion_mad = Some(mad);
+            scores.push(class_score);
+        }
+
+        scores.extend(self.evaluate_account_class_amount_fidelity(original, synthetic));
 
         // If no columns matched but both fingerprints have columns,
         // this indicates completely different schemas - return low score
@@ -322,15 +423,18 @@ impl FidelityEvaluator {
                 return 0.0;
             }
 
-            // Weight the scores by column match ratio
             if scores.is_empty() {
-                // Only categorical columns matched (or numeric columns didn't match)
+                // Only categorical columns matched (no numeric or class-level scores)
                 return match_ratio;
             }
 
-            // Combine column scores with match ratio penalty
             let avg_score = scores.iter().sum::<f64>() / scores.len() as f64;
-            return avg_score * match_ratio;
+            // Statistical fidelity = quality on comparable dimensions. Do not crush by match_ratio
+            // when the original has many columns (e.g. full APRR) and we compare a few (debit,
+            // credit, account, class-level). Use a soft floor so score reflects "how well we match
+            // on what we can compare" rather than "how many columns exist in the source".
+            let effective_ratio = (match_ratio * 2.0).min(1.0).max(0.25);
+            return avg_score * effective_ratio;
         }
 
         if scores.is_empty() {
@@ -340,7 +444,8 @@ impl FidelityEvaluator {
         scores.iter().sum::<f64>() / scores.len() as f64
     }
 
-    /// Compare numeric statistics.
+    /// Compare numeric statistics. Under the log-normal hypothesis, amount columns are
+    /// evaluated primarily by (μ, σ) parameter fidelity when both have positive mean.
     fn compare_numeric_stats(
         &self,
         name: &str,
@@ -350,13 +455,27 @@ impl FidelityEvaluator {
         // KS-like statistic from percentile comparison
         let ks_statistic = self.compute_percentile_ks(original, synthetic);
 
-        // Normalized differences
-        let mean_range = (original.max - original.min).max(1.0);
-        let mean_diff = (original.mean - synthetic.mean) / mean_range;
-        let std_dev_diff = if original.std_dev > 0.0 {
-            (original.std_dev - synthetic.std_dev) / original.std_dev
-        } else {
-            0.0
+        // Log-normal hypothesis: compare (μ, σ) when both have positive mean
+        let (mean_diff, std_dev_diff) = match (
+            lognormal_params_from_stats(original),
+            lognormal_params_from_stats(synthetic),
+        ) {
+            (Some((mu_o, sigma_o)), Some((mu_s, sigma_s))) => {
+                let mu_penalty = (mu_o - mu_s).abs() / (1.0 + mu_o.abs());
+                let sigma_penalty = (sigma_o - sigma_s).abs() / (1.0 + sigma_o);
+                let ln_penalty = (mu_penalty + sigma_penalty).min(2.0);
+                (ln_penalty * 0.5, ln_penalty * 0.5)
+            }
+            _ => {
+                let denom = original.mean.abs() + synthetic.mean.abs() + 1e-10;
+                let mean_diff = (original.mean - synthetic.mean).abs() / denom;
+                let std_dev_diff = if original.std_dev > 1e-10 {
+                    ((original.std_dev - synthetic.std_dev).abs() / original.std_dev).min(2.0)
+                } else {
+                    0.0
+                };
+                (mean_diff, std_dev_diff)
+            }
         };
 
         // Wasserstein-1 distance from percentile-based inverse CDFs
@@ -377,18 +496,162 @@ impl FidelityEvaluator {
         }
     }
 
-    /// Compute KS-like statistic from percentiles.
+    /// Compute KS-like statistic from percentiles (scale-invariant: use max of both ranges).
     fn compute_percentile_ks(&self, original: &NumericStats, synthetic: &NumericStats) -> f64 {
         let orig_pcts = original.percentiles.to_array();
         let syn_pcts = synthetic.percentiles.to_array();
 
-        let range = (original.max - original.min).max(1.0);
+        let range_orig = (original.max - original.min).max(1.0);
+        let range_syn = (synthetic.max - synthetic.min).max(1.0);
+        let range = range_orig.max(range_syn);
 
         orig_pcts
             .iter()
             .zip(syn_pcts.iter())
             .map(|(&o, &s)| ((o - s) / range).abs())
             .fold(0.0, f64::max)
+    }
+
+    /// Statistical fidelity as average class-level similarity.
+    /// For each account class (first digit): proportion similarity + amount distribution similarity;
+    /// returns mean over classes (so score is "average class-level similarity").
+    fn compute_average_class_level_similarity(
+        &self,
+        original: &StatisticsFingerprint,
+        synthetic: &StatisticsFingerprint,
+    ) -> f64 {
+        let orig_total: u64 = original.account_class_stats.iter().map(|s| s.row_count).sum();
+        let syn_total: u64 = synthetic.account_class_stats.iter().map(|s| s.row_count).sum();
+        if orig_total == 0 {
+            return 0.0;
+        }
+        let orig_total_f = orig_total as f64;
+        let syn_total_f = syn_total as f64;
+
+        let mut orig_by_digit: HashMap<char, (u64, Vec<&NumericStats>)> = HashMap::new();
+        for s in &original.account_class_stats {
+            if let Some(d) = class_pattern_first_digit(&s.class_pattern) {
+                let entry = orig_by_digit.entry(d).or_insert((0, Vec::new()));
+                entry.0 += s.row_count;
+                if let Some(ref n) = s.numeric {
+                    entry.1.push(n);
+                }
+            }
+        }
+        let mut syn_by_digit: HashMap<char, (u64, Vec<&NumericStats>)> = HashMap::new();
+        for s in &synthetic.account_class_stats {
+            if let Some(d) = class_pattern_first_digit(&s.class_pattern) {
+                let entry = syn_by_digit.entry(d).or_insert((0, Vec::new()));
+                entry.0 += s.row_count;
+                if let Some(ref n) = s.numeric {
+                    entry.1.push(n);
+                }
+            }
+        }
+
+        let empty_numerics: Vec<&NumericStats> = Vec::new();
+        let mut class_similarities = Vec::new();
+        for (digit, (orig_count, orig_numerics)) in &orig_by_digit {
+            let orig_p = *orig_count as f64 / orig_total_f;
+            let (syn_count, syn_numerics) = syn_by_digit
+                .get(digit)
+                .map(|(c, n)| (*c, n.as_slice()))
+                .unwrap_or((0, empty_numerics.as_slice()));
+            let syn_p = if syn_total > 0 {
+                syn_count as f64 / syn_total_f
+            } else {
+                0.0
+            };
+            let proportion_sim = 1.0 - (orig_p - syn_p).abs().min(1.0);
+
+            let amount_sim = if !orig_numerics.is_empty() && !syn_numerics.is_empty() {
+                let mut amount_scores = Vec::new();
+                for o in orig_numerics {
+                    for s in syn_numerics {
+                        let m = self.compare_numeric_stats(
+                            &format!("class.{}", digit),
+                            o,
+                            s,
+                        );
+                        let score = (1.0
+                            - (m.ks_statistic
+                                + m.mean_diff.min(1.0)
+                                + m.std_dev_diff.min(1.0))
+                                / 3.0)
+                            .max(0.0);
+                        amount_scores.push(score);
+                    }
+                }
+                amount_scores.iter().sum::<f64>() / amount_scores.len() as f64
+            } else {
+                1.0
+            };
+
+            let class_sim = if !orig_numerics.is_empty() && !syn_numerics.is_empty() {
+                (proportion_sim + amount_sim) / 2.0
+            } else {
+                proportion_sim
+            };
+            class_similarities.push(class_sim);
+        }
+
+        if class_similarities.is_empty() {
+            return 0.0;
+        }
+        class_similarities.iter().sum::<f64>() / class_similarities.len() as f64
+    }
+
+    /// Compare amount statistics at account-class level (first 3 digits).
+    /// Groups by first digit so that 1XXX matches 1xx, 411 matches 4xx, etc.
+    fn evaluate_account_class_amount_fidelity(
+        &self,
+        original: &StatisticsFingerprint,
+        synthetic: &StatisticsFingerprint,
+    ) -> Vec<f64> {
+        let mut scores = Vec::new();
+        let mut orig_by_digit: HashMap<char, Vec<(&crate::models::AccountClassStats, &NumericStats)>> =
+            HashMap::new();
+        for s in &original.account_class_stats {
+            if let (Some(digit), Some(n)) =
+                (class_pattern_first_digit(&s.class_pattern), s.numeric.as_ref())
+            {
+                orig_by_digit.entry(digit).or_default().push((s, n));
+            }
+        }
+        let mut syn_by_digit: HashMap<char, Vec<(&crate::models::AccountClassStats, &NumericStats)>> =
+            HashMap::new();
+        for s in &synthetic.account_class_stats {
+            if let (Some(digit), Some(n)) =
+                (class_pattern_first_digit(&s.class_pattern), s.numeric.as_ref())
+            {
+                syn_by_digit.entry(digit).or_default().push((s, n));
+            }
+        }
+        for (digit, orig_list) in &orig_by_digit {
+            let Some(syn_list) = syn_by_digit.get(digit) else { continue };
+            for (_, orig_numeric) in orig_list {
+                let mut class_scores = Vec::new();
+                for (syn_stat, syn_numeric) in syn_list {
+                    let metrics = self.compare_numeric_stats(
+                        &format!("class.{}", syn_stat.class_pattern),
+                        orig_numeric,
+                        syn_numeric,
+                    );
+                    let score = (1.0
+                        - (metrics.ks_statistic
+                            + metrics.mean_diff.min(1.0)
+                            + metrics.std_dev_diff.min(1.0))
+                            / 3.0)
+                        .max(0.0);
+                    class_scores.push(score);
+                }
+                if !class_scores.is_empty() {
+                    let avg = class_scores.iter().sum::<f64>() / class_scores.len() as f64;
+                    scores.push(avg);
+                }
+            }
+        }
+        scores
     }
 
     /// Evaluate correlation fidelity.
@@ -877,6 +1140,55 @@ fn probability_mass_in_interval(
     total_mass
 }
 
+/// First-digit key for matching class patterns: "411" -> '4', "1XXX" -> '1'.
+fn class_pattern_first_digit(pattern: &str) -> Option<char> {
+    pattern.trim().chars().next().filter(|c| c.is_ascii_digit())
+}
+
+/// Compare account-class proportions between original and synthetic fingerprints.
+/// Aggregates by first digit so that 1XXX and 411/412 are comparable.
+/// Returns (MAD of proportions, fidelity score 0..1).
+fn evaluate_account_class_fidelity(
+    original: &StatisticsFingerprint,
+    synthetic: &StatisticsFingerprint,
+) -> (f64, f64) {
+    let orig_total: u64 = original.account_class_stats.iter().map(|s| s.row_count).sum();
+    let syn_total: u64 = synthetic.account_class_stats.iter().map(|s| s.row_count).sum();
+    if orig_total == 0 {
+        return (0.0, 1.0);
+    }
+    let orig_total_f = orig_total as f64;
+    let syn_total_f = syn_total as f64;
+    let mut orig_by_digit: HashMap<char, u64> = HashMap::new();
+    for s in &original.account_class_stats {
+        if let Some(d) = class_pattern_first_digit(&s.class_pattern) {
+            *orig_by_digit.entry(d).or_insert(0) += s.row_count;
+        }
+    }
+    let mut syn_by_digit: HashMap<char, u64> = HashMap::new();
+    for s in &synthetic.account_class_stats {
+        if let Some(d) = class_pattern_first_digit(&s.class_pattern) {
+            *syn_by_digit.entry(d).or_insert(0) += s.row_count;
+        }
+    }
+    let mut mad_sum = 0.0;
+    let mut n = 0;
+    for (digit, &orig_count) in &orig_by_digit {
+        let orig_p = orig_count as f64 / orig_total_f;
+        let syn_count = syn_by_digit.get(digit).copied().unwrap_or(0);
+        let syn_p = if syn_total > 0 {
+            syn_count as f64 / syn_total_f
+        } else {
+            0.0
+        };
+        mad_sum += (orig_p - syn_p).abs();
+        n += 1;
+    }
+    let mad = if n > 0 { mad_sum / n as f64 } else { 0.0 };
+    let score = 1.0 - mad.min(1.0);
+    (mad, score)
+}
+
 /// Compute Benford's Law MAD between two distributions.
 fn compute_benford_mad(original: &[f64; 9], synthetic: &[f64; 9]) -> f64 {
     let sum: f64 = original
@@ -972,6 +1284,18 @@ mod tests {
 
         let mad = compute_benford_mad(&original, &synthetic);
         assert!(mad < 0.001); // Identical distributions
+    }
+
+    #[test]
+    fn test_canonical_column_key_cross_schema() {
+        // FEC/APRR-style names (original fingerprint) vs datasynth journal_entries.csv
+        assert_eq!(canonical_column_key("Debit"), "debit");
+        assert_eq!(canonical_column_key("Credit"), "credit");
+        assert_eq!(canonical_column_key("debit_amount"), "debit");
+        assert_eq!(canonical_column_key("credit_amount"), "credit");
+        assert_eq!(canonical_column_key("CompteNum"), "account");
+        assert_eq!(canonical_column_key("gl_account"), "account");
+        assert_eq!(canonical_column_key("account_number"), "account");
     }
 
     fn make_percentiles(vals: [f64; 9]) -> Percentiles {

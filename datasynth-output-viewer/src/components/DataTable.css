@@ -81,6 +81,29 @@
   font-size: 0.9rem;
 }
 
+.data-table-go-to-page {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.data-table-go-to-page label {
+  font-size: 0.9rem;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.data-table-go-to-page input {
+  width: 3.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #2a2a2a);
+  color: inherit;
+  font-size: 0.9rem;
+  text-align: right;
+}
+
 .data-table-pagination button {
   padding: 0.4rem 0.8rem;
   font-size: 0.9rem;

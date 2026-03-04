@@ -8229,9 +8229,22 @@ pub struct KickbackSchemeConfig {
     #[serde(default = "default_kickback_setup_months")]
     pub setup_months: u32,
 
-    /// Main operation duration in months.
+    /// Main operation (price inflation) duration in months.
     #[serde(default = "default_kickback_operation_months")]
     pub operation_months: u32,
+
+    /// Kickback payments stage duration in months.
+    #[serde(default = "default_kickback_payments_months")]
+    pub kickback_payments_months: u32,
+
+    /// Concealment stage duration in months.
+    #[serde(default = "default_kickback_concealment_months")]
+    pub concealment_months: u32,
+
+    /// Probability per advance (e.g. per day) to emit one inflated-invoice action in the operation stage.
+    /// Lower values yield fewer JEs per scheme. Default 0.08 (~2–3 inflated invoices per month at daily advance).
+    #[serde(default = "default_kickback_inflation_action_probability")]
+    pub inflation_action_probability: f64,
 }
 
 fn default_kickback_probability() -> f64 {
@@ -8261,6 +8274,15 @@ fn default_kickback_setup_months() -> u32 {
 fn default_kickback_operation_months() -> u32 {
     12
 }
+fn default_kickback_payments_months() -> u32 {
+    6
+}
+fn default_kickback_concealment_months() -> u32 {
+    3
+}
+fn default_kickback_inflation_action_probability() -> f64 {
+    0.08
+}
 
 impl Default for KickbackSchemeConfig {
     fn default() -> Self {
@@ -8274,6 +8296,9 @@ impl Default for KickbackSchemeConfig {
             vendor_typical_amount_max: default_kickback_vendor_typical_max(),
             setup_months: default_kickback_setup_months(),
             operation_months: default_kickback_operation_months(),
+            kickback_payments_months: default_kickback_payments_months(),
+            concealment_months: default_kickback_concealment_months(),
+            inflation_action_probability: default_kickback_inflation_action_probability(),
         }
     }
 }

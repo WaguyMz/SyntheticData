@@ -292,7 +292,10 @@ impl FraudScheme for GradualEmbezzlementScheme {
             && rng.random::<f64>() < 0.3; // Random chance
 
         if should_transact {
-            let amount = stage.random_amount(rng);
+            // Use fingerprint distribution when available so fraud amounts are in-distribution (not easy outliers)
+            let amount = context
+                .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                .unwrap_or_else(|| stage.random_amount(rng));
             let account = self.select_account(context, rng);
 
             let mut action = SchemeAction::new(

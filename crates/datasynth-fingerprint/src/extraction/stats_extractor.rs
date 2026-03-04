@@ -225,9 +225,11 @@ fn extract_column_stats(
             .collect();
 
         if numeric_values.len() > values.len() / 2 {
-            // Treat as numeric
+            // Treat as numeric; assume log-normal for amount columns (hypothesis for generation/fidelity)
             let target = format!("{}.{}", table_name, header);
-            let numeric_stats = compute_numeric_stats(&numeric_values, &target, privacy)?;
+            let assume_lognormal = header_looks_like_amount(header);
+            let numeric_stats =
+                compute_numeric_stats(&numeric_values, &target, privacy, assume_lognormal)?;
             stats.add_numeric(table_name, header, numeric_stats);
         } else {
             // Treat as categorical
@@ -250,54 +252,57 @@ fn extract_column_stats(
         // For now, placeholder
     }
 
-    // Per-account-class extraction
+    // Per-account-class extraction: class distribution = distribution of per-account summed amounts
     if let Some(acct_idx) = detect_account_column(headers) {
         let (debit_idx, credit_idx) = detect_amount_columns(headers);
 
-        // Group rows by account class
-        let mut class_amounts: HashMap<(String, String), Vec<f64>> = HashMap::new();
+        // (pattern, label) -> (account -> sum of amounts for that account in this class)
+        let mut class_sums_by_account: HashMap<(String, String), HashMap<String, f64>> =
+            HashMap::new();
         let mut class_row_counts: HashMap<(String, String), u64> = HashMap::new();
         let acct_values = &columns[acct_idx];
         let row_count = acct_values.len();
 
         for row in 0..row_count {
             let acct = &acct_values[row];
-            if let Some((pattern, label)) = account_class(acct) {
+            if let Some((pattern, label)) = account_class_3digit(acct) {
                 let key = (pattern, label.to_string());
                 *class_row_counts.entry(key.clone()).or_insert(0) += 1;
-                let entry = class_amounts.entry(key).or_default();
+                let per_account = class_sums_by_account.entry(key).or_default();
 
-                // Collect non-zero amounts from debit/credit columns
+                let mut row_sum = 0.0_f64;
                 if let Some(di) = debit_idx {
                     if di < columns.len() {
                         if let Ok(v) = columns[di][row].parse::<f64>() {
-                            if v != 0.0 {
-                                entry.push(v);
-                            }
+                            row_sum += v;
                         }
                     }
                 }
                 if let Some(ci) = credit_idx {
                     if ci < columns.len() {
                         if let Ok(v) = columns[ci][row].parse::<f64>() {
-                            if v != 0.0 {
-                                entry.push(v);
-                            }
+                            row_sum += v;
                         }
                     }
+                }
+                if row_sum != 0.0 {
+                    *per_account.entry(acct.to_string()).or_insert(0.0) += row_sum;
                 }
             }
         }
 
-        // Compute stats per class
-        for ((pattern, label), amounts) in &class_amounts {
+        // Class distribution = list of per-account sums (one value per account in that class)
+        for ((pattern, label), per_account_sums) in &class_sums_by_account {
             let mut class_stats = AccountClassStats::new(pattern.clone(), label.clone());
             let key = (pattern.clone(), label.clone());
             class_stats.row_count = *class_row_counts.get(&key).unwrap_or(&0);
 
+            let amounts: Vec<f64> = per_account_sums.values().copied().collect();
             if !amounts.is_empty() {
                 let target = format!("account_class.{}", pattern);
-                if let Ok(numeric) = compute_numeric_stats(amounts, &target, privacy) {
+                if let Ok(numeric) =
+                    compute_numeric_stats(&amounts, &target, privacy, true)
+                {
                     class_stats.numeric = Some(numeric);
                 }
             }
@@ -309,11 +314,33 @@ fn extract_column_stats(
     Ok(stats)
 }
 
-/// Compute numeric statistics.
+/// True if the column header suggests an amount (debit, credit, amount, montant).
+fn header_looks_like_amount(header: &str) -> bool {
+    let h = header.to_lowercase();
+    h.contains("debit")
+        || h.contains("credit")
+        || h.contains("amount")
+        || h.contains("montant")
+}
+
+/// Estimate log-normal (μ, σ) from mean and variance of positive data (method of moments).
+/// Hypothesis: amounts follow log-normal; use this to store and generate from fingerprint.
+fn estimate_lognormal_params(mean: f64, variance: f64) -> (f64, f64) {
+    if mean <= 0.0 {
+        return (0.0, 1.0);
+    }
+    let sigma_sq = (1.0 + variance / mean.powi(2)).ln();
+    let mu = mean.ln() - sigma_sq / 2.0;
+    (mu, sigma_sq.sqrt())
+}
+
+/// Compute numeric statistics. When assume_lognormal is true (amounts, account-class),
+/// we fit and store LogNormal parameters so generation and fidelity use the same assumption.
 fn compute_numeric_stats(
     values: &[f64],
     target: &str,
     privacy: &mut PrivacyEngine,
+    assume_lognormal: bool,
 ) -> FingerprintResult<NumericStats> {
     if values.is_empty() {
         return Ok(NumericStats::new(0, 0.0, 0.0, 0.0, 0.0));
@@ -339,12 +366,18 @@ fn compute_numeric_stats(
     let noised_mean = privacy.add_noise(mean, max - min, &format!("{}.mean", target))?;
     let noised_std_dev =
         privacy.add_noise(std_dev, (max - min) / 2.0, &format!("{}.std_dev", target))?;
+    let noised_var = noised_std_dev.abs().powi(2);
 
     // Compute percentiles
     let percentiles = compute_percentiles(&sorted);
 
-    // Fit distribution
-    let (distribution, params) = fit_distribution(&sorted, mean, std_dev);
+    // Distribution: assume log-normal for amount data (hypothesis for fingerprint generation)
+    let (distribution, params) = if assume_lognormal && noised_mean > 0.0 {
+        let (mu, sigma) = estimate_lognormal_params(noised_mean, noised_var);
+        (DistributionType::LogNormal, DistributionParams::log_normal(mu, sigma.max(0.1)))
+    } else {
+        fit_distribution(&sorted, mean, std_dev)
+    };
 
     // Zero and negative rates
     let zero_rate = sorted.iter().filter(|v| **v == 0.0).count() as f64 / count as f64;
@@ -545,7 +578,25 @@ fn compute_entropy(frequencies: &[CategoryFrequency]) -> f64 {
     entropy
 }
 
+/// Normalize string for header matching (lowercase, strip common accents e.g. é→e).
+fn normalize_header(s: &str) -> String {
+    let lower = s.trim().to_lowercase();
+    lower
+        .chars()
+        .map(|c| match c {
+            'é' | 'è' | 'ê' => 'e',
+            'à' | 'â' => 'a',
+            'ù' | 'û' => 'u',
+            'î' | 'ï' => 'i',
+            'ô' => 'o',
+            'ç' => 'c',
+            _ => c,
+        })
+        .collect()
+}
+
 /// Heuristic: detect which column contains GL account numbers.
+/// Prefers columns that look like account number (e.g. CompteNum) over label (CompteLib).
 fn detect_account_column(headers: &[String]) -> Option<usize> {
     let account_patterns = [
         "gl_account",
@@ -554,34 +605,53 @@ fn detect_account_column(headers: &[String]) -> Option<usize> {
         "konto",
         "compte",
         "kontonummer",
+        "comptenum",
+        "numero_compte",
+        "numéro de compte",
     ];
+    let mut fallback: Option<usize> = None;
     for (i, header) in headers.iter().enumerate() {
-        let lower = header.to_lowercase();
+        if header.trim().is_empty() {
+            continue;
+        }
+        let normalized = normalize_header(header);
         for pattern in &account_patterns {
-            if lower.contains(pattern) {
-                return Some(i);
+            if normalized.contains(&pattern.to_lowercase()) {
+                if fallback.is_none() {
+                    fallback = Some(i);
+                }
+                // Prefer column that has "compte" but not "lib" (e.g. CompteNum over CompteLib).
+                if normalized.contains("compte") && !normalized.contains("lib") {
+                    return Some(i);
+                }
             }
         }
     }
-    None
+    fallback
 }
 
 /// Detect which columns contain debit and credit amounts.
+/// Recognizes English (Debit/Credit) and French FEC (Montant au débit/crédit, Debit, Credit).
 fn detect_amount_columns(headers: &[String]) -> (Option<usize>, Option<usize>) {
     let mut debit_col = None;
     let mut credit_col = None;
     for (i, header) in headers.iter().enumerate() {
-        let lower = header.to_lowercase();
-        if lower.contains("debit") {
+        if header.trim().is_empty() {
+            continue;
+        }
+        let normalized = normalize_header(header);
+        // Match "debit" / "débit" and "credit" / "crédit" (normalized to debit/credit).
+        if normalized.contains("debit") {
             debit_col = Some(i);
-        } else if lower.contains("credit") {
+        } else if normalized.contains("credit") {
             credit_col = Some(i);
         }
     }
     (debit_col, credit_col)
 }
 
-/// Classify an account number into its class (first digit + "XXX").
+/// Classify an account number into its class (first digit + "XXX"). Kept for tests and compatibility.
+#[allow(dead_code)]
 fn account_class(account: &str) -> Option<(String, &'static str)> {
     let first_char = account.trim().chars().next()?;
     if !first_char.is_ascii_digit() {
@@ -589,6 +659,32 @@ fn account_class(account: &str) -> Option<(String, &'static str)> {
     }
     let digit = first_char.to_digit(10)?;
     let pattern = format!("{}XXX", digit);
+    let label = match digit {
+        0 => "Fixed Assets",
+        1 => "Assets",
+        2 => "Liabilities",
+        3 => "Equity",
+        4 => "Revenue",
+        5 => "COGS",
+        6 => "Operating Expenses",
+        7 => "Other Income/Expense",
+        8 => "Tax",
+        9 => "Statistical",
+        _ => "Unknown",
+    };
+    Some((pattern, label))
+}
+
+/// Classify an account number into its class by first 3 digits (zero-padded).
+/// e.g. "411000" -> ("411", "Revenue"), "6" -> ("006", "Operating Expenses").
+fn account_class_3digit(account: &str) -> Option<(String, &'static str)> {
+    let digits: String = account.trim().chars().filter(|c| c.is_ascii_digit()).take(3).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let pattern = format!("{:0>3}", digits);
+    let first_char = pattern.chars().next()?;
+    let digit = first_char.to_digit(10)?;
     let label = match digit {
         0 => "Fixed Assets",
         1 => "Assets",
@@ -683,6 +779,18 @@ mod tests {
         assert_eq!(detect_account_column(&headers), Some(0));
     }
 
+    /// APRR / FEC: prefer CompteNum (account number) over CompteLib (account label).
+    #[test]
+    fn test_detect_account_column_prefers_compte_num_over_lib() {
+        let headers = vec![
+            "JournalCode".to_string(),
+            "CompteNum".to_string(),
+            "CompteLib".to_string(),
+            "Debit".to_string(),
+        ];
+        assert_eq!(detect_account_column(&headers), Some(1));
+    }
+
     // ---- detect_amount_columns tests ----
 
     #[test]
@@ -713,6 +821,25 @@ mod tests {
             "credit".to_string(),
         ];
         assert_eq!(detect_amount_columns(&headers), (None, Some(2)));
+    }
+
+    #[test]
+    fn test_detect_amount_columns_french_fec() {
+        let headers = vec![
+            "CompteNum".to_string(),
+            "Debit".to_string(),
+            "Credit".to_string(),
+        ];
+        assert_eq!(detect_amount_columns(&headers), (Some(1), Some(2)));
+        // French accents (Montant au débit / crédit) normalized by normalize_header
+        let headers_accents = vec![
+            "Montant au débit".to_string(),
+            "Montant au crédit".to_string(),
+        ];
+        assert_eq!(
+            detect_amount_columns(&headers_accents),
+            (Some(0), Some(1))
+        );
     }
 
     #[test]
@@ -887,35 +1014,33 @@ mod tests {
             .map(|s| s.class_pattern.as_str())
             .collect();
 
-        assert!(patterns.contains(&"1XXX"), "Should contain Assets (1XXX)");
-        assert!(
-            patterns.contains(&"2XXX"),
-            "Should contain Liabilities (2XXX)"
-        );
-        assert!(patterns.contains(&"4XXX"), "Should contain Revenue (4XXX)");
-        assert!(patterns.contains(&"5XXX"), "Should contain COGS (5XXX)");
+        // Stats are at first-3-digit class level (110, 200, 400, 500 from 1100, 2000, 4000, 5000)
+        assert!(patterns.contains(&"110"), "Should contain Assets class (110)");
+        assert!(patterns.contains(&"200"), "Should contain Liabilities class (200)");
+        assert!(patterns.contains(&"400"), "Should contain Revenue class (400)");
+        assert!(patterns.contains(&"500"), "Should contain COGS class (500)");
 
-        // Verify row counts
+        // Verify row counts and labels
         for class in &stats.account_class_stats {
             match class.class_pattern.as_str() {
-                "1XXX" => {
-                    assert_eq!(class.row_count, 2, "Assets should have 2 rows");
+                "110" => {
+                    assert_eq!(class.row_count, 2, "110 (Assets) should have 2 rows");
                     assert_eq!(class.class_label, "Assets");
-                    assert!(class.numeric.is_some(), "Assets should have numeric stats");
+                    assert!(class.numeric.is_some(), "110 should have numeric stats");
                 }
-                "2XXX" => {
-                    assert_eq!(class.row_count, 1, "Liabilities should have 1 row");
+                "200" => {
+                    assert_eq!(class.row_count, 1, "200 (Liabilities) should have 1 row");
                     assert_eq!(class.class_label, "Liabilities");
                 }
-                "4XXX" => {
-                    assert_eq!(class.row_count, 3, "Revenue should have 3 rows");
+                "400" => {
+                    assert_eq!(class.row_count, 3, "400 (Revenue) should have 3 rows");
                     assert_eq!(class.class_label, "Revenue");
-                    assert!(class.numeric.is_some(), "Revenue should have numeric stats");
+                    assert!(class.numeric.is_some(), "400 should have numeric stats");
                 }
-                "5XXX" => {
-                    assert_eq!(class.row_count, 2, "COGS should have 2 rows");
+                "500" => {
+                    assert_eq!(class.row_count, 2, "500 (COGS) should have 2 rows");
                     assert_eq!(class.class_label, "COGS");
-                    assert!(class.numeric.is_some(), "COGS should have numeric stats");
+                    assert!(class.numeric.is_some(), "500 should have numeric stats");
                 }
                 _ => panic!("Unexpected class pattern: {}", class.class_pattern),
             }

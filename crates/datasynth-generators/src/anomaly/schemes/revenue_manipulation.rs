@@ -272,7 +272,10 @@ impl FraudScheme for RevenueManipulationScheme {
         let should_act = is_period_end && rng.random::<f64>() < 0.4;
 
         if should_act {
-            let amount = stage.random_amount(rng);
+            let amount = context
+                // Use fingerprint distribution so revenue amounts are in-distribution (not easy outliers)
+                .sample_amount_from_fingerprint(rng, Some("7XXX"))
+                .unwrap_or_else(|| stage.random_amount(rng));
             let action_type = Self::action_type_for_stage(self.current_stage_index);
 
             let mut action = SchemeAction::new(
@@ -307,10 +310,13 @@ impl FraudScheme for RevenueManipulationScheme {
         // Update detection probability
         self.update_detection_probability();
 
-        // Check for year completion
+        // Check for completion only after at least 12 months so all four quarters (including Q4 = stage 1/4) can run
         if context.current_date.year() > self.current_fiscal_year {
-            // New fiscal year - scheme could continue or complete
-            if self.transactions.len() > 20 {
+            let months_active = self.start_date.map(|start| {
+                (context.current_date.year() as i32 - start.year()) * 12
+                    + (context.current_date.month() as i32 - start.month() as i32)
+            }).unwrap_or(0);
+            if months_active >= 12 && self.transactions.len() > 20 {
                 self.status = SchemeStatus::Completed;
             } else {
                 self.current_fiscal_year = context.current_date.year();

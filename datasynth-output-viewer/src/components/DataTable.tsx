@@ -3,6 +3,28 @@ import './DataTable.css';
 
 const DEFAULT_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
 
+/** True if string looks like ISO date (YYYY-MM-DD or with time). */
+function isIsoDateString(s: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}/.test(s.trim());
+}
+
+/** True if string is YYYYMMDD (e.g. FEC date). */
+function isYyyyMmDd(s: string): boolean {
+  return /^\d{8}$/.test(s.trim());
+}
+
+/** Normalize to YYYY-MM-DD for comparable date sort (handles datetime strings). */
+function datePart(s: string): string {
+  return s.trim().slice(0, 10);
+}
+
+/** Parse YYYYMMDD to a string comparable with datePart (YYYY-MM-DD). */
+function yyyyMmDdToIso(s: string): string {
+  const t = s.trim();
+  if (t.length >= 8) return `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}`;
+  return t;
+}
+
 interface DataTableProps<T extends Record<string, unknown>> {
   data: T[];
   columns: {
@@ -22,6 +44,10 @@ interface DataTableProps<T extends Record<string, unknown>> {
   onRowClick?: (row: T) => void;
   /** Optional class name for the selected row (when onRowClick is used and row is selected) */
   selectedRowKey?: string | null;
+  /** Initial sort column key (e.g. "posting_date", "anomaly_date"). */
+  defaultSortKey?: string | null;
+  /** Initial sort direction. */
+  defaultSortDir?: 'asc' | 'desc';
 }
 
 export function DataTable<T extends Record<string, unknown>>({
@@ -33,11 +59,15 @@ export function DataTable<T extends Record<string, unknown>>({
   maxHeight = '60vh',
   onRowClick,
   selectedRowKey = null,
+  defaultSortKey = null,
+  defaultSortDir = 'asc',
 }: DataTableProps<T>) {
   const paginationId = useId();
+  const goToPageId = useId();
   const [page, setPage] = useState(0);
-  const [sortKey, setSortKey] = useState<string | null>(null);
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const [sortKey, setSortKey] = useState<string | null>(defaultSortKey ?? null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>(defaultSortDir);
+  const [goToPageInput, setGoToPageInput] = useState('');
   const [currentPageSize, setCurrentPageSize] = useState(() =>
     pageSizeOptions.length && pageSizeOptions.includes(pageSize)
       ? pageSize
@@ -70,8 +100,28 @@ export function DataTable<T extends Record<string, unknown>>({
 
     const cmp = (a: unknown, b: unknown): number => {
       if (a == null && b == null) return 0;
-      if (a == null) return -1;
-      if (b == null) return 1;
+      if (a == null || a === '') return -1;
+      if (b == null || b === '') return 1;
+
+      const as = String(a).trim();
+      const bs = String(b).trim();
+
+      // Chronological sort for ISO date strings (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss)
+      if (isIsoDateString(as) && isIsoDateString(bs)) {
+        const da = datePart(as);
+        const db = datePart(bs);
+        return da.localeCompare(db);
+      }
+      // FEC-style YYYYMMDD (no hyphen)
+      if (isYyyyMmDd(as) && isYyyyMmDd(bs)) {
+        return yyyyMmDdToIso(as).localeCompare(yyyyMmDdToIso(bs));
+      }
+      // One ISO, one YYYYMMDD: normalize both to YYYY-MM-DD for comparison
+      const normA = isIsoDateString(as) ? datePart(as) : isYyyyMmDd(as) ? yyyyMmDdToIso(as) : as;
+      const normB = isIsoDateString(bs) ? datePart(bs) : isYyyyMmDd(bs) ? yyyyMmDdToIso(bs) : bs;
+      if (isIsoDateString(normA) && isIsoDateString(normB)) {
+        return normA.localeCompare(normB);
+      }
 
       const an =
         typeof a === 'number'
@@ -85,8 +135,6 @@ export function DataTable<T extends Record<string, unknown>>({
         return an === bn ? 0 : an < bn ? -1 : 1;
       }
 
-      const as = String(a);
-      const bs = String(b);
       return as.localeCompare(bs);
     };
 
@@ -94,7 +142,22 @@ export function DataTable<T extends Record<string, unknown>>({
       const av = getVal(ra, key);
       const bv = getVal(rb, key);
       const base = cmp(av, bv);
-      return sortDir === 'asc' ? base : -base;
+      if (base !== 0) return sortDir === 'asc' ? base : -base;
+      // Tie-break by line/écriture number when sorting by date (same FEC/document)
+      const dateSortKeys = ['posting_date', 'anomaly_date', "Date de comptabilisation"];
+      if (dateSortKeys.includes(key)) {
+        const lineKey = key === "Date de comptabilisation" ? "Numéro de l'écriture" : 'line_number';
+        const la = getVal(ra, lineKey);
+        const lb = getVal(rb, lineKey);
+        if (la != null && lb != null) {
+          const na = typeof la === 'number' ? la : Number(la);
+          const nb = typeof lb === 'number' ? lb : Number(lb);
+          if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+            return sortDir === 'asc' ? na - nb : nb - na;
+          }
+        }
+      }
+      return 0;
     });
     return copy;
   }, [data, sortKey, sortDir]);
@@ -152,10 +215,25 @@ export function DataTable<T extends Record<string, unknown>>({
               })}
             </tr>
           </thead>
-          <tbody>
+          <tbody key={`page-${page}`}>
             {slice.map((row, i) => {
-              const key = keyField ? String(getVal(row, keyField)) || `row-${page * currentPageSize + i}` : `row-${page * currentPageSize + i}`;
-              const isSelected = selectedRowKey != null && key === selectedRowKey;
+              // Unique key per row: keyField + secondary when present; always add slice index so keys are unique even when data has duplicate (document_id, line_number)
+              const baseKey = keyField ? String(getVal(row, keyField)) : '';
+              const secondary =
+                keyField && getVal(row, 'line_number') != null
+                  ? String(getVal(row, 'line_number'))
+                  : keyField && getVal(row, "Numéro de compte") != null
+                    ? String(getVal(row, "Numéro de compte"))
+                    : null;
+              const sliceIndex = page * currentPageSize + i;
+              const key =
+                (baseKey && secondary !== null
+                  ? `${baseKey}-${secondary}-${sliceIndex}`
+                  : baseKey
+                    ? `${baseKey}-${sliceIndex}`
+                    : `row-${sliceIndex}`) ||
+                `row-${sliceIndex}`;
+              const isSelected = selectedRowKey != null && baseKey === selectedRowKey;
               return (
               <tr
                 key={key}
@@ -212,6 +290,41 @@ export function DataTable<T extends Record<string, unknown>>({
               </button>
               <span>
                 Page {page + 1} of {totalPages} ({rowCount} rows)
+              </span>
+              <span className="data-table-go-to-page">
+                <label htmlFor={goToPageId}>Go to page</label>
+                <input
+                  id={goToPageId}
+                  type="number"
+                  min={1}
+                  max={totalPages}
+                  value={goToPageInput}
+                  onChange={(e) => setGoToPageInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const n = Number(goToPageInput);
+                      if (Number.isFinite(n) && n >= 1 && n <= totalPages) {
+                        setPage(n - 1);
+                        setGoToPageInput('');
+                      }
+                    }
+                  }}
+                  placeholder={`1–${totalPages}`}
+                  aria-label="Page number"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const n = Number(goToPageInput);
+                    if (Number.isFinite(n) && n >= 1 && n <= totalPages) {
+                      setPage(n - 1);
+                      setGoToPageInput('');
+                    }
+                  }}
+                >
+                  Go
+                </button>
               </span>
               <button
                 type="button"

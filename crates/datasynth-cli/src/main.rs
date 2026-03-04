@@ -75,6 +75,10 @@ enum Commands {
         #[arg(short, long)]
         seed: Option<u64>,
 
+        /// Override period_months (1–120). Use when config or fingerprint uses a shorter period than desired.
+        #[arg(long)]
+        period_months: Option<u32>,
+
         /// Enable banking KYC/AML data generation
         #[arg(long)]
         banking: bool,
@@ -258,6 +262,7 @@ fn main() -> Result<()> {
             fingerprint,
             scale,
             seed,
+            period_months,
             banking,
             audit,
             memory_limit,
@@ -373,6 +378,19 @@ fn main() -> Result<()> {
                     // Apply seed override
                     if let Some(s) = seed {
                         cfg.global.seed = Some(s);
+                    }
+
+                    // Apply period_months override (ensures requested span is used)
+                    if let Some(p) = period_months {
+                        let clamped = p.clamp(1, SAFETY_MAX_PERIOD_MONTHS);
+                        if clamped != p {
+                            tracing::warn!(
+                                "period_months {} clamped to valid range 1..={}",
+                                p, SAFETY_MAX_PERIOD_MONTHS
+                            );
+                        }
+                        cfg.global.period_months = clamped;
+                        tracing::info!("Period set to {} months (from --period-months)", cfg.global.period_months);
                     }
 
                     // Enable banking if flag is set (with conservative defaults)
@@ -531,6 +549,13 @@ fn main() -> Result<()> {
                     EnhancedOrchestrator::new(cfg, phase_config)?
                 }
             };
+
+            // Override period_months for fingerprint mode (config path already applied in match above)
+            if let Some(p) = period_months {
+                let clamped = p.clamp(1, SAFETY_MAX_PERIOD_MONTHS);
+                orchestrator.set_period_months(clamped);
+                tracing::info!("Period set to {} months (from --period-months)", clamped);
+            }
 
             let result = orchestrator.generate()?;
 
@@ -1224,6 +1249,67 @@ fn main() -> Result<()> {
             }
 
             // ========================================
+            // CONFIDENTIALITY SCORE (fingerprint-based generation only)
+            // ========================================
+            if let Some(ref fp_path) = fingerprint {
+                let reader = FingerprintReader::new();
+                match reader.read_from_file(fp_path) {
+                    Ok(original_fp) => {
+                        let je_csv = output.join("journal_entries.csv");
+                        let csv_path = if je_csv.exists() {
+                            Some(je_csv)
+                        } else {
+                            std::fs::read_dir(&output).ok().and_then(|rd| {
+                                rd.filter_map(|e| e.ok())
+                                    .map(|e| e.path())
+                                    .find(|p| p.extension().is_some_and(|ext| ext == "csv"))
+                            })
+                        };
+                        if let Some(path) = csv_path {
+                            let data_source = DataSource::Csv(CsvDataSource::new(&path));
+                            let evaluator = FidelityEvaluator::new();
+                            match evaluator.evaluate(&original_fp, &data_source) {
+                                Ok(report) => {
+                                    println!();
+                                    println!("Confidentiality score (fidelity to fingerprint)");
+                                    println!("=================================================");
+                                    println!("  Overall:        {:.1}%", report.overall_score * 100.0);
+                                    println!("  Statistical:   {:.1}%", report.statistical_fidelity * 100.0);
+                                    println!("  Correlation:   {:.1}%", report.correlation_fidelity * 100.0);
+                                    println!("  Schema:        {:.1}%", report.schema_fidelity * 100.0);
+                                    println!("  Rule:          {:.1}%", report.rule_compliance * 100.0);
+                                    println!("  Anomaly:       {:.1}%", report.anomaly_fidelity * 100.0);
+                                    println!("  Pass:          {}", if report.passes { "yes" } else { "no" });
+                                    println!();
+                                    let report_path = output.join("fingerprint_fidelity_report.json");
+                                    if let Ok(json) = serde_json::to_string_pretty(&report) {
+                                        if std::fs::write(&report_path, json).is_ok() {
+                                            tracing::info!(
+                                                "Confidentiality report written to: {}",
+                                                report_path.display()
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Could not compute confidentiality score: {}",
+                                    e
+                                ),
+                            }
+                        } else {
+                            tracing::warn!(
+                                "No CSV in output to evaluate confidentiality; skipping score"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "Could not re-read fingerprint for confidentiality score: {}",
+                        e
+                    ),
+                }
+            }
+
+            // ========================================
             // QUALITY GATE EVALUATION
             // ========================================
             if quality_gate != "none" {
@@ -1565,6 +1651,19 @@ fn handle_fingerprint_command(command: FingerprintCommands) -> Result<()> {
                 );
             }
             writer.write_to_file(&fingerprint, &output)?;
+
+            // Write human-readable JSON alongside: e.g. fp.dsf -> fp_fingerprint.json
+            let json_stem = output
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let json_path = output
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(format!("{}_fingerprint.json", json_stem));
+            let json_file = std::fs::File::create(&json_path)?;
+            serde_json::to_writer_pretty(json_file, &fingerprint)?;
+            tracing::info!("Fingerprint (human-readable) written to: {}", json_path.display());
 
             tracing::info!("Fingerprint written to: {}", output.display());
             tracing::info!(
@@ -2036,15 +2135,19 @@ fn create_safe_demo_preset() -> GeneratorConfig {
     }
 }
 
+/// Maximum period months allowed by config validation (datasynth-config); safety limit aligns with this.
+const SAFETY_MAX_PERIOD_MONTHS: u32 = 120;
+
 /// Apply safety limits to a loaded configuration.
 fn apply_safety_limits(config: &mut GeneratorConfig) {
-    // Limit period to 12 months max
-    if config.global.period_months > 12 {
+    // Limit period to SAFETY_MAX_PERIOD_MONTHS (120 = 10 years); config validation uses the same cap
+    if config.global.period_months > SAFETY_MAX_PERIOD_MONTHS {
         tracing::warn!(
-            "Safety limit: period_months truncated from {} to 12",
-            config.global.period_months
+            "Safety limit: period_months truncated from {} to {}",
+            config.global.period_months,
+            SAFETY_MAX_PERIOD_MONTHS
         );
-        config.global.period_months = 12;
+        config.global.period_months = SAFETY_MAX_PERIOD_MONTHS;
     }
 
     // Limit transaction volume

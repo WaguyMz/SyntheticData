@@ -194,6 +194,8 @@ export function JECView() {
             keyField="document_id"
             pageSize={100}
             maxHeight="65vh"
+            defaultSortKey="posting_date"
+            defaultSortDir="asc"
           />
         </>
       )}
@@ -226,6 +228,8 @@ export function JECView() {
             keyField="Numéro de l'écriture"
             pageSize={100}
             maxHeight="65vh"
+            defaultSortKey="Date de comptabilisation"
+            defaultSortDir="asc"
           />
         </>
       )}

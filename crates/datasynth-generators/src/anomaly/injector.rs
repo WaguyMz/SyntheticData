@@ -81,6 +81,12 @@ pub struct EnhancedInjectionConfig {
     /// Vendor typical order amount range when no prior base is recorded.
     pub scheme_kickback_vendor_typical_min: Option<f64>,
     pub scheme_kickback_vendor_typical_max: Option<f64>,
+    /// Kickback scheme stage durations and inflation action probability (fewer = shorter schemes).
+    pub scheme_kickback_setup_months: Option<u32>,
+    pub scheme_kickback_operation_months: Option<u32>,
+    pub scheme_kickback_payments_months: Option<u32>,
+    pub scheme_kickback_concealment_months: Option<u32>,
+    pub scheme_kickback_inflation_action_probability: Option<f64>,
     pub scheme_triad_bypass_probability: Option<f64>,
     pub scheme_shadow_payroll_probability: Option<f64>,
     pub scheme_expense_laundering_probability: Option<f64>,
@@ -200,6 +206,8 @@ pub struct AnomalyInjector {
     account_contexts: HashMap<String, AccountContext>,
     /// Counter for scheme-derived anomaly IDs (ANO-S00000001, ...).
     scheme_label_count: u32,
+    /// Per-account-class amount configs from fingerprint so fraud amounts stay in-distribution (set by runtime when generating from fingerprint).
+    fingerprint_amount_configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
 }
 
 /// Injection statistics tracking.
@@ -265,6 +273,26 @@ impl AnomalyInjector {
                     .enhanced
                     .scheme_kickback_vendor_typical_max
                     .unwrap_or(50_000.0),
+                kickback_setup_months: config
+                    .enhanced
+                    .scheme_kickback_setup_months
+                    .unwrap_or(3),
+                kickback_operation_months: config
+                    .enhanced
+                    .scheme_kickback_operation_months
+                    .unwrap_or(6),
+                kickback_payments_months: config
+                    .enhanced
+                    .scheme_kickback_payments_months
+                    .unwrap_or(4),
+                kickback_concealment_months: config
+                    .enhanced
+                    .scheme_kickback_concealment_months
+                    .unwrap_or(2),
+                kickback_inflation_action_probability: config
+                    .enhanced
+                    .scheme_kickback_inflation_action_probability
+                    .unwrap_or(0.08),
                 triad_bypass_probability: config
                     .enhanced
                     .scheme_triad_bypass_probability
@@ -376,7 +404,16 @@ impl AnomalyInjector {
             employee_contexts: HashMap::new(),
             account_contexts: HashMap::new(),
             scheme_label_count: 0,
+            fingerprint_amount_configs: None,
         }
+    }
+
+    /// Sets per-account-class amount configs from fingerprint so fraud scheme amounts stay in-distribution (not easy outliers).
+    pub fn set_fingerprint_amount_configs(
+        &mut self,
+        configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
+    ) {
+        self.fingerprint_amount_configs = configs;
     }
 
     /// Processes a batch of journal entries, potentially injecting anomalies.
@@ -592,6 +629,9 @@ impl AnomalyInjector {
         }
         if let Some(ref amt) = ms.action_amount {
             label = label.with_metadata("action_amount", &amt.to_string());
+        }
+        if let Some(ref ref_id) = ms.reference {
+            label = label.with_metadata("reused_invoice", ref_id);
         }
         Some(label)
     }
@@ -1068,6 +1108,7 @@ impl AnomalyInjector {
             context.available_users = available_users;
             context.available_accounts = available_accounts;
             context.available_counterparties = available_counterparties;
+            context.fingerprint_amount_configs = self.fingerprint_amount_configs.clone();
             let actions = advancer.advance_all(&context);
             for action in &actions {
                 let anomaly_id = format!("ANO-S{:08}", self.scheme_label_count);
@@ -1110,6 +1151,7 @@ impl AnomalyInjector {
             context.available_users = available_users;
             context.available_accounts = available_accounts;
             context.available_counterparties = available_counterparties;
+            context.fingerprint_amount_configs = self.fingerprint_amount_configs.clone();
 
             advancer.maybe_start_scheme(&context)
         } else {

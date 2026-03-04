@@ -271,7 +271,10 @@ impl FraudScheme for ShadowPayrollScheme {
                 let already_paid = self.last_payroll_month == Some(current_month);
 
                 if !already_paid && Self::is_last_business_day_of_month(context.current_date) {
-                    let gross = stage.random_amount(rng);
+                    let gross = context
+                        // Use fingerprint distribution so payroll amounts are in-distribution (not easy outliers)
+                        .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                        .unwrap_or_else(|| stage.random_amount(rng));
                     let social_ratio = Self::sample_social_charge_ratio(rng);
                     let social_charges = gross
                         * Decimal::from_f64_retain(social_ratio).unwrap_or(dec!(0.42));
@@ -323,7 +326,10 @@ impl FraudScheme for ShadowPayrollScheme {
                     actions.push(term_action);
 
                     // FinalSettlement: last payroll / severance payment (Dr 421000, Cr 512000)
-                    let settlement_amount = stage.random_amount(rng);
+                    let settlement_amount = context
+                        // Use fingerprint distribution so payroll amounts are in-distribution (not easy outliers)
+                        .sample_amount_from_fingerprint(rng, Some("6XXX"))
+                        .unwrap_or_else(|| stage.random_amount(rng));
                     let settle_action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,

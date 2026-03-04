@@ -70,6 +70,10 @@ pub struct JournalEntryGenerator {
     business_day_calculator: Option<BusinessDayCalculator>,
     processing_lag_calculator: Option<ProcessingLagCalculator>,
     temporal_patterns_config: Option<TemporalPatternsConfig>,
+    /// Account class proportions from fingerprint (e.g. "1XXX" -> 0.2) for biasing account selection
+    account_class_proportions: Option<std::collections::HashMap<String, f64>>,
+    /// Per-account-class amount configs from fingerprint for sampling amounts by class
+    account_class_amount_configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
 }
 
 /// State for tracking batch processing behavior.
@@ -227,7 +231,27 @@ impl JournalEntryGenerator {
             business_day_calculator: None,
             processing_lag_calculator: None,
             temporal_patterns_config: None,
+            account_class_proportions: None,
+            account_class_amount_configs: None,
         }
+    }
+
+    /// Use per-account-class amount distributions from fingerprint for amount sampling.
+    pub fn with_account_class_amount_configs(
+        mut self,
+        configs: std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>,
+    ) -> Self {
+        self.account_class_amount_configs = Some(configs);
+        self
+    }
+
+    /// Bias account selection by fingerprint account-class proportions (e.g. "1XXX" -> 0.2).
+    pub fn with_account_class_proportions(
+        mut self,
+        proportions: std::collections::HashMap<String, f64>,
+    ) -> Self {
+        self.account_class_proportions = Some(proportions);
+        self
     }
 
     /// Create from a full GeneratorConfig.
@@ -858,12 +882,29 @@ impl JournalEntryGenerator {
         // Generate line items
         let mut entry = JournalEntry::new(header);
 
-        // Generate amount - use fraud pattern if this is a fraudulent transaction
-        let base_amount = if let Some(ft) = fraud_type {
-            let pattern = self.fraud_type_to_amount_pattern(ft);
-            self.amount_sampler.sample_fraud(pattern)
+        // When per-class amount configs are present, select debit first and sample amount from that class's distribution
+        let account_class_amount_configs = self.account_class_amount_configs.clone();
+        let (debit_account, base_amount) = if let Some(ref configs) = account_class_amount_configs {
+            let debit = self.select_debit_account().account_number.clone();
+            let class = Self::account_class_pattern(&debit);
+            let base = if let Some(ft) = fraud_type {
+                let pattern = self.fraud_type_to_amount_pattern(ft);
+                self.amount_sampler.sample_fraud(pattern)
+            } else if let Some(cfg) = configs.get(&class) {
+                datasynth_core::AmountSampler::with_config(self.rng.random(), cfg.clone()).sample()
+            } else {
+                self.amount_sampler.sample()
+            };
+            (debit, base)
         } else {
-            self.amount_sampler.sample()
+            let base = if let Some(ft) = fraud_type {
+                let pattern = self.fraud_type_to_amount_pattern(ft);
+                self.amount_sampler.sample_fraud(pattern)
+            } else {
+                self.amount_sampler.sample()
+            };
+            let debit = self.select_debit_account().account_number.clone();
+            (debit, base)
         };
 
         // Apply temporal drift if configured
@@ -889,7 +930,6 @@ impl JournalEntryGenerator {
         // One debit and one credit line per entry: avoid repeating the same GL account
         // in the same document. Multipayment should be represented as separate entries
         // on different days, not multiple lines with the same account.
-        let debit_account = self.select_debit_account().account_number.clone();
         let mut debit_line = JournalEntryLine::debit(
             entry.header.document_id,
             1,
@@ -1708,16 +1748,41 @@ impl JournalEntryGenerator {
         }
     }
 
+    /// Derive account class pattern (e.g. "6XXX") from account number for per-class amount sampling.
+    fn account_class_pattern(account_number: &str) -> String {
+        let first = account_number.trim().chars().next();
+        match first.and_then(|c| c.to_digit(10)) {
+            Some(d) => format!("{}XXX", d),
+            None => "0XXX".to_string(),
+        }
+    }
+
     #[inline]
     fn select_debit_account(&mut self) -> &GLAccount {
         let accounts = self.coa.get_accounts_by_type(AccountType::Asset);
         let expense_accounts = self.coa.get_accounts_by_type(AccountType::Expense);
 
-        // 60% asset, 40% expense for debits
-        let all: Vec<_> = if self.rng.random::<f64>() < 0.6 {
-            accounts
+        let all: Vec<_> = if let Some(ref proportions) = self.account_class_proportions {
+            let w1 = proportions.get("1XXX").copied().unwrap_or(0.0);
+            let w6 = proportions.get("6XXX").copied().unwrap_or(0.0);
+            let total = w1 + w6;
+            let use_asset = if total > 0.0 {
+                self.rng.random::<f64>() < (w1 / total)
+            } else {
+                self.rng.random::<f64>() < 0.6
+            };
+            if use_asset {
+                accounts
+            } else {
+                expense_accounts
+            }
         } else {
-            expense_accounts
+            // 60% asset, 40% expense for debits
+            if self.rng.random::<f64>() < 0.6 {
+                accounts
+            } else {
+                expense_accounts
+            }
         };
 
         all.choose(&mut self.rng).copied().unwrap_or_else(|| {
@@ -1746,11 +1811,27 @@ impl JournalEntryGenerator {
         let liability_accounts = self.coa.get_accounts_by_type(AccountType::Liability);
         let revenue_accounts = self.coa.get_accounts_by_type(AccountType::Revenue);
 
-        // 60% liability, 40% revenue for credits
-        let all: Vec<_> = if self.rng.random::<f64>() < 0.6 {
-            liability_accounts
+        let all: Vec<_> = if let Some(ref proportions) = self.account_class_proportions {
+            let w2 = proportions.get("2XXX").copied().unwrap_or(0.0);
+            let w7 = proportions.get("7XXX").copied().unwrap_or(0.0);
+            let total = w2 + w7;
+            let use_liability = if total > 0.0 {
+                self.rng.random::<f64>() < (w2 / total)
+            } else {
+                self.rng.random::<f64>() < 0.6
+            };
+            if use_liability {
+                liability_accounts
+            } else {
+                revenue_accounts
+            }
         } else {
-            revenue_accounts
+            // 60% liability, 40% revenue for credits
+            if self.rng.random::<f64>() < 0.6 {
+                liability_accounts
+            } else {
+                revenue_accounts
+            }
         };
 
         all.choose(&mut self.rng).copied().unwrap_or_else(|| {
@@ -1868,6 +1949,8 @@ impl ParallelGenerator for JournalEntryGenerator {
                 gen.persona_errors_enabled = self.persona_errors_enabled;
                 gen.approval_enabled = self.approval_enabled;
                 gen.approval_threshold = self.approval_threshold;
+                gen.account_class_proportions = self.account_class_proportions.clone();
+                gen.account_class_amount_configs = self.account_class_amount_configs.clone();
 
                 // Use partitioned UUID factory to eliminate atomic contention
                 gen.uuid_factory = DeterministicUuidFactory::for_partition(

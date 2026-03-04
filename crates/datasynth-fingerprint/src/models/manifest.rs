@@ -195,6 +195,7 @@ impl PrivacyMetadata {
 pub enum PrivacyLevel {
     /// Minimal privacy protection (epsilon=5.0, k=3).
     /// Use for low-sensitivity data where utility is priority.
+    #[serde(alias = "tiny")]
     Minimal,
 
     /// Standard privacy protection (epsilon=1.0, k=5).

@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 
+use datasynth_core::AmountDistributionConfig;
+
+use super::distribution_fitter::{estimate_lognormal_params, fit_account_class_distributions, FittedDistribution};
 use super::CopulaGenerator;
 use crate::error::FingerprintResult;
 use crate::models::{
@@ -170,6 +173,45 @@ pub struct SynthesisResult {
     pub config_patch: ConfigPatch,
     /// Copula generators for preserving correlations (if enabled and correlations present).
     pub copula_generators: Vec<CopulaGeneratorSpec>,
+    /// Account class proportions (e.g. "1XXX" -> 0.2) from fingerprint for biasing JE account selection.
+    pub account_class_proportions: Option<HashMap<String, f64>>,
+    /// Per-account-class amount distribution configs for sampling amounts by class (from fingerprint numeric stats).
+    pub account_class_amount_configs: Option<HashMap<String, AmountDistributionConfig>>,
+}
+
+/// Convert fitted per-class distribution to AmountDistributionConfig for sampling.
+fn fitted_distribution_to_amount_config(
+    dist: &FittedDistribution,
+) -> Option<AmountDistributionConfig> {
+    use crate::models::DistributionType;
+    let (mu, sigma) = match dist.distribution_type {
+        DistributionType::LogNormal => {
+            let mu = dist.params.param1?;
+            let sigma = dist.params.param2?;
+            if sigma <= 0.0 {
+                return None;
+            }
+            (mu, sigma)
+        }
+        _ => {
+            if dist.mean <= 0.0 {
+                return None;
+            }
+            let variance = dist.std_dev * dist.std_dev;
+            estimate_lognormal_params(dist.mean, variance)
+        }
+    };
+    let min_amount = dist.min.max(0.01);
+    let max_amount = dist.max.max(min_amount * 1.01);
+    Some(AmountDistributionConfig {
+        min_amount,
+        max_amount,
+        lognormal_mu: mu,
+        lognormal_sigma: sigma,
+        decimal_places: 2,
+        round_number_probability: 0.2,
+        nice_number_probability: 0.15,
+    })
 }
 
 /// Specification for a copula generator.
@@ -234,10 +276,89 @@ impl ConfigSynthesizer {
             }
         }
 
+        // Account class proportions (first 3 digits / class pattern) for JE account selection
+        let account_class_proportions = Self::account_class_proportions_from_fingerprint(fingerprint);
+
+        // Per-class amount distributions from fingerprint (numeric stats per account class)
+        let account_class_amount_configs =
+            Self::account_class_amount_configs_from_fingerprint(fingerprint);
+
         Ok(SynthesisResult {
             config_patch,
             copula_generators,
+            account_class_proportions,
+            account_class_amount_configs,
         })
+    }
+
+    /// Build per-account-class amount configs from fingerprint for JE amount sampling.
+    /// Aggregates 3-digit patterns to 1XXX: for each first digit, uses the 3-digit class with
+    /// the largest row_count as representative so the generator can look up by 6XXX, 7XXX.
+    fn account_class_amount_configs_from_fingerprint(
+        fingerprint: &Fingerprint,
+    ) -> Option<HashMap<String, AmountDistributionConfig>> {
+        let stats = &fingerprint.statistics.account_class_stats;
+        if stats.is_empty() {
+            return None;
+        }
+        let fitted = fit_account_class_distributions(stats).ok()?;
+        if fitted.is_empty() {
+            return None;
+        }
+        let mut by_1xxx: HashMap<String, (u64, AmountDistributionConfig)> = HashMap::new();
+        for (pattern, dist) in fitted {
+            let key_1xxx = match Self::pattern_to_1xxx(&pattern) {
+                Some(k) => k,
+                None => continue,
+            };
+            let cfg = fitted_distribution_to_amount_config(&dist)?;
+            let row_count = stats.iter().find(|s| s.class_pattern == pattern)?.row_count;
+            let entry = by_1xxx.entry(key_1xxx).or_insert((0, cfg));
+            if row_count > entry.0 {
+                entry.0 = row_count;
+                entry.1 = fitted_distribution_to_amount_config(&dist).unwrap();
+            }
+        }
+        let map: HashMap<String, AmountDistributionConfig> = by_1xxx
+            .into_iter()
+            .map(|(k, (_, cfg))| (k, cfg))
+            .collect();
+        if map.is_empty() {
+            return None;
+        }
+        Some(map)
+    }
+
+    /// Normalize class pattern to 1XXX for generator (first digit + "XXX").
+    fn pattern_to_1xxx(pattern: &str) -> Option<String> {
+        pattern.trim().chars().next().filter(|c| c.is_ascii_digit()).map(|d| format!("{}XXX", d))
+    }
+
+    /// Build account-class proportions (e.g. "1XXX" -> 0.2) from fingerprint for JE account selection.
+    /// Aggregates 3-digit patterns (411, 512) to 1XXX so the generator can look up by 6XXX, 7XXX.
+    fn account_class_proportions_from_fingerprint(
+        fingerprint: &Fingerprint,
+    ) -> Option<HashMap<String, f64>> {
+        let stats = &fingerprint.statistics.account_class_stats;
+        if stats.is_empty() {
+            return None;
+        }
+        let total: u64 = stats.iter().map(|s| s.row_count).sum();
+        if total == 0 {
+            return None;
+        }
+        let total_f = total as f64;
+        let mut by_1xxx: HashMap<String, u64> = HashMap::new();
+        for s in stats {
+            if let Some(key) = Self::pattern_to_1xxx(&s.class_pattern) {
+                *by_1xxx.entry(key).or_insert(0) += s.row_count;
+            }
+        }
+        let map = by_1xxx
+            .into_iter()
+            .map(|(k, count)| (k, count as f64 / total_f))
+            .collect();
+        Some(map)
     }
 
     /// Create a copula generator from a Gaussian copula specification.

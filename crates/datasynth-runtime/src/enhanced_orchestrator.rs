@@ -985,6 +985,10 @@ pub struct EnhancedOrchestrator {
     output_path: Option<PathBuf>,
     /// Copula generators for preserving correlations (from fingerprint)
     copula_generators: Vec<CopulaGeneratorSpec>,
+    /// Account class proportions from fingerprint (e.g. "1XXX" -> 0.2) for JE account selection
+    account_class_proportions: Option<std::collections::HashMap<String, f64>>,
+    /// Per-account-class amount configs from fingerprint for JE amount sampling by class
+    account_class_amount_configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
     /// Country pack registry for localized data generation
     country_pack_registry: datasynth_core::CountryPackRegistry,
 }
@@ -1019,6 +1023,8 @@ impl EnhancedOrchestrator {
             resource_guard,
             output_path: None,
             copula_generators: Vec::new(),
+            account_class_proportions: None,
+            account_class_amount_configs: None,
             country_pack_registry,
         })
     }
@@ -1026,6 +1032,11 @@ impl EnhancedOrchestrator {
     /// Create with default phase config.
     pub fn with_defaults(config: GeneratorConfig) -> SynthResult<Self> {
         Self::new(config, PhaseConfig::default())
+    }
+
+    /// Override the generation period (months). Use when config or fingerprint has a shorter period than desired.
+    pub fn set_period_months(&mut self, months: u32) {
+        self.config.global.period_months = months;
     }
 
     /// Enable/disable progress bars.
@@ -1238,6 +1249,10 @@ impl EnhancedOrchestrator {
 
         // Store copula generators for use during generation
         orchestrator.copula_generators = synthesis_result.copula_generators;
+        // Store account class proportions so JE generator can bias account selection
+        orchestrator.account_class_proportions = synthesis_result.account_class_proportions;
+        // Store per-class amount configs so JE generator can sample amounts by account class
+        orchestrator.account_class_amount_configs = synthesis_result.account_class_amount_configs;
 
         Ok(orchestrator)
     }
@@ -5529,6 +5544,13 @@ impl EnhancedOrchestrator {
             .with_persona_errors(true)
             .with_fraud_config(self.config.fraud.clone());
 
+        if let Some(ref proportions) = self.account_class_proportions {
+            generator = generator.with_account_class_proportions(proportions.clone());
+        }
+        if let Some(ref configs) = self.account_class_amount_configs {
+            generator = generator.with_account_class_amount_configs(configs.clone());
+        }
+
         // Apply temporal drift if configured
         if self.config.temporal.enabled {
             let drift_config = self.config.temporal.to_core_config();
@@ -6402,6 +6424,11 @@ impl EnhancedOrchestrator {
             scheme_kickback_amount_shift_percent: Some(schemes.kickback.amount_shift_percent),
             scheme_kickback_vendor_typical_min: Some(schemes.kickback.vendor_typical_amount_min),
             scheme_kickback_vendor_typical_max: Some(schemes.kickback.vendor_typical_amount_max),
+            scheme_kickback_setup_months: Some(schemes.kickback.setup_months),
+            scheme_kickback_operation_months: Some(schemes.kickback.operation_months),
+            scheme_kickback_payments_months: Some(schemes.kickback.kickback_payments_months),
+            scheme_kickback_concealment_months: Some(schemes.kickback.concealment_months),
+            scheme_kickback_inflation_action_probability: Some(schemes.kickback.inflation_action_probability),
             scheme_triad_bypass_probability: Some(schemes.triad_bypass.probability),
             scheme_shadow_payroll_probability: Some(schemes.shadow_payroll.probability),
             scheme_expense_laundering_probability: Some(schemes.expense_laundering.probability),
@@ -6434,6 +6461,12 @@ impl EnhancedOrchestrator {
         };
 
         let mut injector = AnomalyInjector::new(anomaly_config);
+        // When generating from a fingerprint, pass per-class amount configs so schemes sample
+        // fraud amounts from the same distributions (6XXX/7XXX etc.). This keeps fraud
+        // in-distribution and avoids trivial outlier detection.
+        if let Some(ref configs) = self.account_class_amount_configs {
+            injector.set_fingerprint_amount_configs(Some(configs.clone()));
+        }
 
         // Drive multi-stage scheme advancer so all configured scheme types can produce labels.
         // We advance schemes once per calendar day in the posting-date range for each company,
@@ -6764,6 +6797,20 @@ impl EnhancedOrchestrator {
             .unwrap_or("2000");
 
         let (ap, ar, bank, expense, revenue) = Self::scheme_gl_accounts(coa);
+        // Revenue manipulation stage-specific accounts (PCG): provisions, deferred charges, other income
+        let (provisions, deferred_charges, other_income) = if is_pcg {
+            (
+                pcg::equity_liability_accounts::PROVISIONS.to_string(),
+                pcg::tax_accounts::DEFERRED_CHARGES.to_string(),
+                pcg::revenue_accounts::OTHER_REVENUE.to_string(),
+            )
+        } else {
+            (
+                "151000".to_string(), // provisions / accrued liabilities
+                "486000".to_string(), // deferred charges
+                revenue.clone(),     // fallback to main revenue
+            )
+        };
         // PCG typical accounts from technical report (Single-FEC scope).
         let (_embezzlement_debit, kickback_expense_debit, expense_laundering_debit, salaries_wages, wages_payable, suspense) = if is_pcg {
             (
@@ -6853,13 +6900,14 @@ impl EnhancedOrchestrator {
                         (preferred, offset)
                     }
                 }
-                // Revenue manipulation (all stages): Dr 411000 (AR), Cr 701000 (Revenue) — never Class 1.
-                SchemeActionType::ManipulateRevenue
-                | SchemeActionType::DeferExpense
-                | SchemeActionType::ReleaseReserves
-                | SchemeActionType::ChannelStuff => {
+                // Revenue manipulation: stage 1/4 early recognition & 4/4 channel stuffing = Dr AR, Cr Revenue
+                SchemeActionType::ManipulateRevenue | SchemeActionType::ChannelStuff => {
                     (ar.as_str(), revenue.as_str())
                 }
+                // Stage 2/4 expense deferral: Dr Deferred charges (asset), Cr Expense
+                SchemeActionType::DeferExpense => (deferred_charges.as_str(), expense.as_str()),
+                // Stage 3/4 reserve release: Dr Provisions (liability), Cr Other income
+                SchemeActionType::ReleaseReserves => (provisions.as_str(), other_income.as_str()),
                 SchemeActionType::InventoryTransferToGhostLocation => {
                     let offset = if preferred == default_credit {
                         default_debit
@@ -7308,11 +7356,8 @@ impl EnhancedOrchestrator {
                         ));
                     }
                 }
-                // Revenue manipulation (all four stages). PCG: Dr 411000 + Dr 418100 (invoices to be issued), Cr 701000.
-                SchemeActionType::ManipulateRevenue
-                | SchemeActionType::DeferExpense
-                | SchemeActionType::ReleaseReserves
-                | SchemeActionType::ChannelStuff => {
+                // Revenue manipulation stage 1/4 (early recognition) & 4/4 (channel stuffing): Dr AR, Cr Revenue
+                SchemeActionType::ManipulateRevenue | SchemeActionType::ChannelStuff => {
                     if is_pcg {
                         let ar_amount = amount * Decimal::new(9, 1); // 0.9 * amount
                         let adj_amount = amount * Decimal::new(1, 1); // 0.1 * amount
@@ -7350,6 +7395,36 @@ impl EnhancedOrchestrator {
                             amount,
                         ));
                     }
+                }
+                // Stage 2/4 expense deferral: Dr Deferred charges (asset), Cr Expense
+                SchemeActionType::DeferExpense => {
+                    entry.add_line(JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        deferred_charges.clone(),
+                        amount,
+                    ));
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        expense.clone(),
+                        amount,
+                    ));
+                }
+                // Stage 3/4 reserve release: Dr Provisions (liability), Cr Other income
+                SchemeActionType::ReleaseReserves => {
+                    entry.add_line(JournalEntryLine::debit(
+                        action.scheme_id,
+                        1,
+                        provisions.clone(),
+                        amount,
+                    ));
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id,
+                        2,
+                        other_income.clone(),
+                        amount,
+                    ));
                 }
                 // Ghost employee. PCG: Dr 641100 (gross) + Dr 645100 (URSSAF 20%), Cr 421000 (gross+social).
                 SchemeActionType::CreateGhostEmployee => {

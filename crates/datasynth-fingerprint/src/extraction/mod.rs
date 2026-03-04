@@ -493,10 +493,16 @@ impl FingerprintExtractor {
                     continue;
                 }
 
-                // Determine if column is numeric (on first batch)
-                let is_numeric = column_is_numeric
-                    .entry(i)
-                    .or_insert_with(|| field.parse::<f64>().is_ok() || field.is_empty());
+                // Determine if column is numeric: amount-like columns (debit/credit/amount/montant)
+                // are always treated as numeric so fidelity evaluation can match them across schemas.
+                let is_numeric = column_is_numeric.entry(i).or_insert_with(|| {
+                    let header = headers.get(i).map(|s| s.to_lowercase()).unwrap_or_default();
+                    let name_looks_like_amount = header.contains("debit")
+                        || header.contains("credit")
+                        || header.contains("amount")
+                        || header.contains("montant");
+                    name_looks_like_amount || field.parse::<f64>().is_ok() || field.is_empty()
+                });
 
                 if *is_numeric {
                     if let Ok(value) = field.parse::<f64>() {
@@ -551,15 +557,36 @@ impl FingerprintExtractor {
 
         for (i, acc) in numeric_accumulators {
             let header = &headers[i];
+            let mean = acc.mean();
+            let std_dev = acc.std_dev();
+            let (distribution, distribution_params) =
+                if (header.to_lowercase().contains("debit")
+                    || header.to_lowercase().contains("credit")
+                    || header.to_lowercase().contains("amount")
+                    || header.to_lowercase().contains("montant"))
+                    && mean > 0.0
+                {
+                    let (mu, sigma) =
+                        crate::synthesis::estimate_lognormal_params(mean, std_dev * std_dev);
+                    (
+                        crate::models::DistributionType::LogNormal,
+                        crate::models::DistributionParams::log_normal(mu, sigma.max(0.1)),
+                    )
+                } else {
+                    (
+                        crate::models::DistributionType::Unknown,
+                        crate::models::DistributionParams::empty(),
+                    )
+                };
             let numeric_stats = crate::models::NumericStats {
                 count: acc.count(),
                 min: acc.min(),
                 max: acc.max(),
-                mean: acc.mean(),
-                std_dev: acc.std_dev(),
+                mean,
+                std_dev,
                 percentiles: acc.percentiles(),
-                distribution: crate::models::DistributionType::Unknown,
-                distribution_params: crate::models::DistributionParams::empty(),
+                distribution,
+                distribution_params,
                 zero_rate: acc.zero_rate(),
                 negative_rate: acc.negative_rate(),
                 benford_first_digit: Some(acc.benford_distribution()),

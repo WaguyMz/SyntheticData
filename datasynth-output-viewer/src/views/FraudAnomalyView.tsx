@@ -25,7 +25,6 @@ const SCHEME_TAXONOMY: Array<{ key: string; name: string; category: 'Sequential'
   { key: 'triad_bypass', name: 'Triad Bypass', category: 'Relational', description: 'Payment reusing old invoice ID' },
   { key: 'shadow_payroll', name: 'Shadow Payroll', category: 'Sequential', description: 'Ghost employee, fraudulent payroll' },
   { key: 'expense_laundering', name: 'Expense Laundering', category: 'Volume', description: 'Micro-expenses to shell vendors' },
-  { key: 'smurfing', name: 'Smurfing', category: 'Volume', description: 'Many small below-threshold payments' },
 ];
 
 const TABLE_COLUMNS = [
@@ -37,6 +36,7 @@ const TABLE_COLUMNS = [
   { key: 'pathology_display', label: 'Pathology', width: '160px' },
   { key: 'perpetrator_id', label: 'Perpetrator (employee)', width: '120px' },
   { key: 'counterparty_display', label: 'Involved counterparty (vendor/customer)', width: '160px' },
+  { key: 'reused_invoice_display', label: 'Reused Invoice', width: '130px' },
   { key: 'scheme_je_count', label: '# JEs in scheme', width: '110px' },
   { key: 'stage_display', label: 'Stage', width: '64px' },
   { key: 'company_code', label: 'Company', width: '80px' },
@@ -51,6 +51,7 @@ const CONCERNED_FULL_COLUMNS = [
   { key: 'line_number', label: '#', width: '44px' },
   // All JEs in this table share the same scheme instance (scenario_id).
   { key: 'scenario_id', label: 'Scheme instance ID', width: '180px' },
+  { key: 'stage_display', label: 'Stage', width: '64px' },
   { key: 'document_id', label: 'Document ID', width: '130px' },
   { key: 'company_code', label: 'Company', width: '80px' },
   { key: 'fiscal_year', label: 'FY', width: '44px' },
@@ -106,6 +107,16 @@ function InvolvedEntitiesSummary({ scenarioId, labels }: { scenarioId: string; l
   const dateMin = sortedDates[0] ?? '';
   const dateMax = sortedDates.length ? sortedDates[sortedDates.length - 1] : '';
   const pathology = (schemeLabels[0]?.pathology_name as string) || (schemeLabels[0]?.type_display as string) || '';
+  const reusedInvoices = [...new Set(
+    schemeLabels
+      .map((l) => {
+        const meta = typeof l.metadata === 'object' && l.metadata && !Array.isArray(l.metadata)
+          ? (l.metadata as Record<string, unknown>)
+          : {};
+        return ((meta.reused_invoice ?? meta.reference) as string) || (l.reused_invoice_display as string) || '';
+      })
+      .filter(Boolean)
+  )];
 
   return (
     <div className="fraud-anomaly-involved-entities" aria-label="Involved entities summary">
@@ -128,6 +139,12 @@ function InvolvedEntitiesSummary({ scenarioId, labels }: { scenarioId: string; l
           <>
             <dt>Involved counterparty (vendor/customer)</dt>
             <dd>{counterparties.join(', ')}</dd>
+          </>
+        )}
+        {reusedInvoices.length > 0 && (
+          <>
+            <dt>Reused invoice</dt>
+            <dd>{reusedInvoices.join(', ')}</dd>
           </>
         )}
         {documentIds.length > 0 && (
@@ -215,7 +232,6 @@ function labelMatchesScheme(label: AnomalyLabel, schemeKey: string): boolean {
   if (schemeKey === 'triad_bypass' && (typeStr.includes('triad') || pathNorm.includes('triad'))) return true;
   if (schemeKey === 'shadow_payroll' && (typeStr.includes('payroll') || pathNorm.includes('shadow'))) return true;
   if (schemeKey === 'expense_laundering' && (typeStr.includes('expense') || pathNorm.includes('laundering'))) return true;
-  if (schemeKey === 'smurfing' && (typeStr.includes('smurf') || pathNorm.includes('smurf'))) return true;
   if (schemeKey === 'circular_funding' && (typeStr.includes('circular') || pathNorm.includes('circular'))) return true;
   if (schemeKey === 'phantom_warehousing' && (typeStr.includes('phantom') || pathNorm.includes('warehousing'))) return true;
   if (schemeKey === 'intercompany_wash_trades' && (typeStr.includes('intercompany') || typeStr.includes('wash') || pathNorm.includes('wash'))) return true;
@@ -353,6 +369,7 @@ function normalizeLabels(
     const counterparty = (r.counterparty as string) || meta.counterparty;
     const total_stages = r.total_stages ?? meta.total_stages;
     const action_amount = (r.action_amount as string | number) ?? meta.action_amount;
+    const reused_invoice = (r.reused_invoice as string) || meta.reused_invoice || meta.reference;
 
     let scenario: string;
     if (scenarioId) {
@@ -390,6 +407,7 @@ function normalizeLabels(
       perpetrator_id: perpetrator_id || undefined,
       counterparty: counterparty || undefined,
       counterparty_display: counterparty || '—',
+      reused_invoice_display: reused_invoice || '—',
       action_amount: action_amount ?? undefined,
       pathology_display: pathology_display || (isScheme ? '—' : ''),
       scheme_je_count: schemeJeCount,
@@ -533,10 +551,18 @@ export function FraudAnomalyView() {
       const allInScheme = displayLabels.filter((l) => (l.scenario_id as string)?.trim() === sid);
       const perpetrators = [...new Set(allInScheme.map((l) => (l.perpetrator_id as string) || '').filter(Boolean))];
       const counterparties = [...new Set(allInScheme.map((l) => (l.counterparty as string) || '').filter(Boolean))];
+      // Stage column: show all stages present in the scheme (e.g. "1/4, 2/4, 3/4, 4/4"), not just the representative label's stage
+      const stageSet = new Set<string>();
+      allInScheme.forEach((l) => {
+        const s = (l.stage_display as string) || (l.stage_number != null ? `${l.stage_number}/${l.total_stages ?? '?'}` : '');
+        if (s) stageSet.add(s);
+      });
+      const stage_display = stageSet.size ? [...stageSet].sort().join(', ') : row.stage_display;
       return {
         ...row,
         perpetrator_id: perpetrators.length ? perpetrators.join(', ') : row.perpetrator_id,
         counterparty_display: counterparties.length ? counterparties.join(', ') : (row.counterparty_display ?? '—'),
+        stage_display: stage_display ?? row.stage_display,
       };
     });
     return [...enriched, ...singles];
@@ -669,12 +695,30 @@ export function FraudAnomalyView() {
       return !Number.isFinite(d) || !Number.isFinite(c) || Math.abs(d) > 1e-6 || Math.abs(c) > 1e-6;
     });
 
+    // Map document_id → stage from labels for this scheme (one label per document).
+    const docIdToStage = new Map<string, string>();
+    if (scenarioId) {
+      displayLabels
+        .filter((l) => (l.scenario_id as string)?.trim() === scenarioId)
+        .forEach((l) => {
+          const docId = (l.document_id as string)?.trim();
+          if (!docId) return;
+          const stage = (l.stage_display as string) || (l.stage_number != null ? `${l.stage_number}/${l.total_stages ?? '?'}` : '');
+          if (stage) {
+            docIdToStage.set(norm(docId), stage);
+            if (docId.startsWith('scheme-')) docIdToStage.set(norm(docId.slice(7)), stage);
+          }
+        });
+    }
+
     const withImpact = rows.map((r) => {
       const key = norm(String(r.document_id ?? ''));
       const impact = docImpactMap.get(key);
+      const stage_display = docIdToStage.get(key) ?? '';
       return {
         ...r,
         entry_impact: impact,
+        stage_display: stage_display || undefined,
       };
     });
 
@@ -760,8 +804,8 @@ export function FraudAnomalyView() {
       <h2>Fraud, Anomalies &amp; Schemes</h2>
       <p className="fraud-anomaly-desc">
         Labels from <code>labels/anomaly_labels</code> and <code>labels/fraud_labels</code>. All{' '}
-        <strong>7 fraud scheme types</strong> (RIP-GNN pathology lab) are supported: Gradual Embezzlement, Revenue
-        Manipulation, Vendor Kickback, Triad Bypass, Shadow Payroll, Expense Laundering, Smurfing. Scheme instances are grouped by <code>scenario_id</code>.
+        <strong>6 fraud scheme types</strong> (RIP-GNN pathology lab) are supported: Gradual Embezzlement, Revenue
+        Manipulation, Vendor Kickback, Triad Bypass, Shadow Payroll, Expense Laundering. Scheme instances are grouped by <code>scenario_id</code>.
         Click a row to view the concerned transaction; select a scheme instance to see its instance-wise graph.
       </p>
       {labels.length === 0 ? (
@@ -956,6 +1000,8 @@ export function FraudAnomalyView() {
             keyField="anomaly_id"
             pageSize={50}
             maxHeight="40vh"
+            defaultSortKey="anomaly_date"
+            defaultSortDir="asc"
             onRowClick={(row) => {
               const r = row as AnomalyLabel;
               const id = r.anomaly_id != null ? String(r.anomaly_id) : null;
@@ -1026,6 +1072,8 @@ export function FraudAnomalyView() {
                     keyField="_rowKey"
                     pageSize={20}
                     maxHeight="40vh"
+                    defaultSortKey="posting_date"
+                    defaultSortDir="asc"
                   />
                 </>
               )}

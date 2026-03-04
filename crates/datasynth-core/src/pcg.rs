@@ -134,6 +134,8 @@ pub mod tax_accounts {
     pub const DEFERRED_TAX_LIABILITY: &str = "155000";
     /// Charges à répartir / actif impôt différé (Deferred Tax Asset)
     pub const DEFERRED_TAX_ASSET: &str = "481000";
+    /// Charges à répartir (Deferred charges / prepaid expense) – Class 4 regulatory
+    pub const DEFERRED_CHARGES: &str = "486000";
 }
 
 /// Suspense and clearing accounts.
