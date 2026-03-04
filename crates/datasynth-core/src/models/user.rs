@@ -7,6 +7,7 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use super::master_data::BankAccount;
 
 /// User persona classification for behavioral modeling.
 ///
@@ -628,6 +629,11 @@ pub struct Employee {
     /// Location / plant
     pub location: Option<String>,
 
+    /// Primary payroll bank account (e.g., IBAN) for salary payments.
+    /// Used for coherence checks and fraud schemes (e.g., shadow payroll).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bank_account: Option<BankAccount>,
+
     /// Is this an intercompany employee (works for multiple entities)?
     pub is_shared_services: bool,
 
@@ -689,6 +695,7 @@ impl Employee {
             hire_date: None,
             termination_date: None,
             location: None,
+            bank_account: None,
             is_shared_services: false,
             phone: None,
             is_fraud_actor: false,

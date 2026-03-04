@@ -468,6 +468,13 @@ impl CustomerGenerator {
         self.coa_framework = framework;
     }
 
+    /// Override default country and currency (used by orchestrator when a specific
+    /// accounting framework such as French PCG requires a fixed locale like FR/EUR).
+    pub fn override_default_country_currency(&mut self, country: &str, currency: &str) {
+        self.config.default_country = country.to_string();
+        self.config.default_currency = currency.to_string();
+    }
+
     /// Set segmentation configuration.
     pub fn set_segmentation_config(&mut self, segmentation_config: CustomerSegmentationConfig) {
         self.segmentation_config = segmentation_config;

@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 use datasynth_core::models::{
-    Employee, EmployeePool, EmployeeStatus, JobLevel, SystemRole, TransactionCodeAuth,
+    BankAccount, Employee, EmployeePool, EmployeeStatus, JobLevel, SystemRole, TransactionCodeAuth,
 };
 use datasynth_core::templates::{MultiCultureNameGenerator, NameCulture};
 use datasynth_core::utils::seeded_rng;
@@ -287,6 +287,9 @@ impl EmployeeGenerator {
             });
         }
 
+        // Generate payroll bank account (IBAN-like) for salary payments
+        employee.bank_account = Some(self.generate_payroll_bank_account(company_code, &employee.employee_id));
+
         // Set status
         employee.status = self.select_status();
         if employee.status == EmployeeStatus::Terminated {
@@ -295,6 +298,30 @@ impl EmployeeGenerator {
         }
 
         employee
+    }
+
+    /// Generate a deterministic payroll bank account for an employee.
+    fn generate_payroll_bank_account(
+        &mut self,
+        company_code: &str,
+        employee_id: &str,
+    ) -> BankAccount {
+        // Simple FR-style IBAN stub: FRkk + bank/branch + account number
+        let bank = self.rng.random_range(10000u32..99999u32);
+        let branch = self.rng.random_range(10000u32..99999u32);
+        let acct = self.rng.random_range(10000000000u64..99999999999u64);
+        let iban = format!("FR76{:05}{:05}{:011}", bank, branch, acct);
+        let bic = "PAYROLLFRXXX".to_string();
+        let bank_name = format!("Payroll Bank {}", company_code);
+
+        BankAccount {
+            bank_name,
+            bank_country: "FR".to_string(),
+            account_number: iban,
+            routing_code: bic,
+            holder_name: employee_id.to_string(),
+            is_primary: true,
+        }
     }
 
     /// Generate an employee with specific job level.

@@ -12,7 +12,7 @@
                     {"number": 10, "label": "Aufwendungen für die Ingangsetzung und Erweiterung des Geschäftsbetriebs", "system": "developed", "accounts": []},
                     {"number": 20, "label": "Konzessionen, gewerbliche Schutzrechte", "system": "developed", "accounts": []},
                     {"number": 27, "label": "EDV-Software", "system": "developed", "accounts": []},
-                    {"number": 30, "label": "Lizenzen", "system": "developed", "accounts": []},
+                    {"number": 30, "label": "Lizenzen", "system": "developed", "accounts": []}, 
                     {"number": 35, "label": "Firmenwert (Geschäfts- oder Firmenwert)", "system": "developed", "accounts": []},
                     {"number": 50, "label": "Geleistete Anzahlungen imm. Vermögensgegenstände", "system": "developed", "accounts": []}
                 ]

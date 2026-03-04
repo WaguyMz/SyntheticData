@@ -100,6 +100,39 @@ fn pcg_account_group(number: u32) -> u32 {
     n
 }
 
+/// Find a PCG label by account number in the full PCG tree.
+fn find_pcg_label(nodes: &[PcgNode], target: u32) -> Option<String> {
+    for node in nodes {
+        if node.number == target {
+            return Some(node.label.clone());
+        }
+        if let Some(label) = find_pcg_label(&node.accounts, target) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Given a normalized 6-digit GL account (e.g. "603000"), find the first matching
+/// ancestor label in the PCG tree by stripping digits from right to left
+/// (603000 → 60300 → 6030 → 603) and returning the first label found.
+pub fn pcg_label_for_normalized(root: &PcgRoot, code: &str) -> Option<String> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits = trimmed.to_string();
+    while !digits.is_empty() {
+        if let Ok(num) = digits.parse::<u32>() {
+            if let Some(label) = find_pcg_label(root, num) {
+                return Some(label);
+            }
+        }
+        digits.pop();
+    }
+    None
+}
+
 /// Map PCG class and account number to our AccountType and AccountSubType.
 fn pcg_to_account_type(class: u8, number: u32) -> (AccountType, AccountSubType) {
     use AccountSubType::{
@@ -181,6 +214,40 @@ pub fn build_chart_of_accounts_from_pcg_2024(
             account.is_suspense_account = true;
         }
         coa.add_account(account);
+    }
+
+    // Ensure key PCG accounts used by generators are always present so JEs are visible
+    // in GL/FEC. Account names are resolved from the PCG tree (no hardcoded labels).
+    for (code, acc_type, sub_type) in [
+        (
+            "603000",
+            AccountType::Expense,
+            AccountSubType::OperatingExpenses,
+        ),
+        (
+            "641100",
+            AccountType::Expense,
+            AccountSubType::OperatingExpenses,
+        ),
+        (
+            "645100",
+            AccountType::Expense,
+            AccountSubType::OperatingExpenses,
+        ),
+        (
+            "421000",
+            AccountType::Liability,
+            AccountSubType::AccruedLiabilities,
+        ),
+    ] {
+        if coa.get_account(code).is_none() {
+            let label = pcg_label_for_normalized(&root, code)
+                .unwrap_or_else(|| code.to_string());
+            let mut account =
+                GLAccount::new(code.to_string(), label, acc_type, sub_type);
+            account.requires_cost_center = acc_type == AccountType::Expense;
+            coa.add_account(account);
+        }
     }
 
     Ok(coa)

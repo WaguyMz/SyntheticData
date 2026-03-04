@@ -319,6 +319,13 @@ impl VendorGenerator {
         self.coa_framework = framework;
     }
 
+    /// Override default country and currency (used by orchestrator when a specific
+    /// accounting framework such as French PCG requires a fixed locale like FR/EUR).
+    pub fn override_default_country_currency(&mut self, country: &str, currency: &str) {
+        self.config.default_country = country.to_string();
+        self.config.default_currency = currency.to_string();
+    }
+
     /// Set network configuration.
     pub fn set_network_config(&mut self, network_config: VendorNetworkConfig) {
         self.network_config = network_config;

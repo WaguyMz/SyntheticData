@@ -18,7 +18,7 @@
 //! 15. Bank reconciliation generation
 //! 16. Financial statement generation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1377,6 +1377,106 @@ impl EnhancedOrchestrator {
         Ok(())
     }
 
+    /// Infer a generic AccountType / AccountSubType from the first digit of an account code.
+    /// This is only used for accounts that were not present in the original CoA but are
+    /// referenced by journal entries; names come from PCG/SKR or fallback labels.
+    fn infer_account_type_for_code(code: &str) -> (AccountType, AccountSubType) {
+        use AccountSubType::{
+            Cash, Inventory, OperatingExpenses, OtherAssets, OtherLiabilities, ProductRevenue,
+            SuspenseClearing,
+        };
+        use AccountType::{Asset, Equity, Expense, Liability, Revenue};
+
+        let first = code.chars().next().unwrap_or('0');
+        match first {
+            '1' | '2' => (Equity, OtherAssets),
+            '3' => (Asset, Inventory),
+            '4' => (Liability, OtherLiabilities),
+            '5' => (Asset, Cash),
+            '6' => (Expense, OperatingExpenses),
+            '7' => (Revenue, ProductRevenue),
+            '8' => (Asset, SuspenseClearing),
+            _ => (Asset, OtherAssets),
+        }
+    }
+
+    /// After all journal entries are generated, ensure that every GL account referenced
+    /// by any line exists in the chart of accounts and has a name.
+    ///
+    /// - For French PCG runs (coa.country == "FR"), names are resolved from pcg_2024.json
+    ///   using a first-ancestor search (603000 → 603 → label from PCG).
+    /// - For other countries, we fall back to using the account code as the name.
+    fn ensure_all_accounts_named(
+        &self,
+        chart_of_accounts: &mut ChartOfAccounts,
+        entries: &[JournalEntry],
+    ) {
+        let mut missing: HashSet<String> = HashSet::new();
+        for je in entries {
+            for line in &je.lines {
+                let code = line.gl_account.trim();
+                if code.is_empty() {
+                    continue;
+                }
+                if chart_of_accounts.get_account(code).is_none() {
+                    missing.insert(code.to_string());
+                }
+            }
+        }
+
+        if missing.is_empty() {
+            return;
+        }
+
+        if chart_of_accounts.country == "FR" {
+            // French PCG: resolve labels from the embedded PCG 2024 JSON.
+            match datasynth_core::pcg_loader::load_pcg_2024() {
+                Ok(root) => {
+                    for code in missing {
+                        if chart_of_accounts.get_account(&code).is_some() {
+                            continue;
+                        }
+                        let label = datasynth_core::pcg_loader::pcg_label_for_normalized(&root, &code)
+                            .unwrap_or_else(|| code.clone());
+                        let (acc_type, sub_type) = Self::infer_account_type_for_code(&code);
+                        let mut account =
+                            GLAccount::new(code.clone(), label, acc_type, sub_type);
+                        account.requires_cost_center = acc_type == AccountType::Expense;
+                        chart_of_accounts.add_account(account);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load PCG 2024 for account naming (FR); falling back to code-only labels: {}",
+                        e
+                    );
+                    for code in missing {
+                        if chart_of_accounts.get_account(&code).is_some() {
+                            continue;
+                        }
+                        let (acc_type, sub_type) = Self::infer_account_type_for_code(&code);
+                        let mut account =
+                            GLAccount::new(code.clone(), code.clone(), acc_type, sub_type);
+                        account.requires_cost_center = acc_type == AccountType::Expense;
+                        chart_of_accounts.add_account(account);
+                    }
+                }
+            }
+        } else {
+            // Non-PCG: just ensure the account exists with a generic name = code.
+            for code in missing {
+                if chart_of_accounts.get_account(&code).is_some() {
+                    continue;
+                }
+                let (acc_type, sub_type) = Self::infer_account_type_for_code(&code);
+                let mut account =
+                    GLAccount::new(code.clone(), code.clone(), acc_type, sub_type);
+                account.requires_cost_center = acc_type == AccountType::Expense;
+                chart_of_accounts.add_account(account);
+            }
+        }
+    }
+
     /// Run the complete generation workflow.
     pub fn generate(&mut self) -> SynthResult<EnhancedGenerationResult> {
         info!("Starting enhanced generation workflow");
@@ -1483,7 +1583,7 @@ impl EnhancedOrchestrator {
 
         // Phase 6b: Generate JEs from payroll runs
         if !hr.payroll_runs.is_empty() {
-            let payroll_jes = Self::generate_payroll_jes(&hr.payroll_runs);
+            let payroll_jes = Self::generate_payroll_jes(&hr.payroll_runs, &coa);
             debug!("Generated {} JEs from payroll runs", payroll_jes.len());
             entries.extend(payroll_jes);
         }
@@ -1689,8 +1789,13 @@ impl EnhancedOrchestrator {
             Vec::new()
         };
 
+        // Before returning, ensure that every GL account referenced in entries exists
+        // in the chart of accounts and has a name (especially important for PCG/FR).
+        let mut chart_of_accounts = (*coa).clone();
+        self.ensure_all_accounts_named(&mut chart_of_accounts, &entries);
+
         Ok(EnhancedGenerationResult {
-            chart_of_accounts: (*coa).clone(),
+            chart_of_accounts,
             master_data: self.master_data.clone(),
             document_flows,
             subledger,
@@ -5057,6 +5162,10 @@ impl EnhancedOrchestrator {
                 let mut vendor_gen = VendorGenerator::new(company_seed);
                 vendor_gen.set_country_pack(pack.clone());
                 vendor_gen.set_coa_framework(coa_framework);
+                // When using French PCG, force FR/EUR for all vendors.
+                if matches!(coa_framework, CoAFramework::FrenchPcg) {
+                    vendor_gen.override_default_country_currency("FR", "EUR");
+                }
                 let vendor_pool =
                     vendor_gen.generate_vendor_pool(vendors_per_company, &company.code, start_date);
 
@@ -5064,6 +5173,10 @@ impl EnhancedOrchestrator {
                 let mut customer_gen = CustomerGenerator::new(company_seed + 100);
                 customer_gen.set_country_pack(pack.clone());
                 customer_gen.set_coa_framework(coa_framework);
+                // When using French PCG, force FR/EUR for all customers.
+                if matches!(coa_framework, CoAFramework::FrenchPcg) {
+                    customer_gen.override_default_country_currency("FR", "EUR");
+                }
                 let customer_pool = customer_gen.generate_customer_pool(
                     customers_per_company,
                     &company.code,
@@ -5549,12 +5662,20 @@ impl EnhancedOrchestrator {
 
     /// Generate journal entries from payroll runs.
     ///
-    /// Creates one JE per payroll run:
-    /// - DR Salaries & Wages (6100) for gross pay
-    /// - CR Payroll Clearing (9100) for gross pay
-    fn generate_payroll_jes(payroll_runs: &[PayrollRun]) -> Vec<JournalEntry> {
+    /// When the COA is French (country == "FR"), uses PCG accounts and posts employer
+    /// social security (645100 Cotisations à l'URSSAF):
+    /// - DR 641100 (Salaires, appointements) for gross
+    /// - DR 645100 (Cotisations à l'URSSAF) for employer cost
+    /// - CR 421000 (Personnel payable) for total employer cost
+    ///
+    /// Otherwise uses generic accounts: DR 6100, CR 9100 for gross only.
+    fn generate_payroll_jes(
+        payroll_runs: &[PayrollRun],
+        coa: &ChartOfAccounts,
+    ) -> Vec<JournalEntry> {
         use datasynth_core::accounts::{expense_accounts, suspense_accounts};
 
+        let use_pcg = coa.country == "FR";
         let mut jes = Vec::with_capacity(payroll_runs.len());
 
         for run in payroll_runs {
@@ -5565,27 +5686,68 @@ impl EnhancedOrchestrator {
                 format!("Payroll {}", run.payroll_id),
             );
 
-            // Debit Salaries & Wages for gross pay
-            je.add_line(JournalEntryLine {
-                line_number: 1,
-                gl_account: expense_accounts::SALARIES_WAGES.to_string(),
-                debit_amount: run.total_gross,
-                reference: Some(run.payroll_id.clone()),
-                text: Some(format!(
-                    "Payroll {} ({} employees)",
-                    run.payroll_id, run.employee_count
-                )),
-                ..Default::default()
-            });
+            if use_pcg {
+                // French/PCG: 641100 (Salaires), 645100 (Cotisations URSSAF), 421000 (Personnel payable)
+                let employer_social =
+                    (run.total_employer_cost - run.total_gross).max(rust_decimal::Decimal::ZERO);
 
-            // Credit Payroll Clearing for gross pay
-            je.add_line(JournalEntryLine {
-                line_number: 2,
-                gl_account: suspense_accounts::PAYROLL_CLEARING.to_string(),
-                credit_amount: run.total_gross,
-                reference: Some(run.payroll_id.clone()),
-                ..Default::default()
-            });
+                je.add_line(JournalEntryLine {
+                    line_number: 1,
+                    gl_account: pcg::expense_accounts::SALARIES_WAGES.to_string(),
+                    debit_amount: run.total_gross,
+                    reference: Some(run.payroll_id.clone()),
+                    text: Some(format!(
+                        "Payroll {} ({} employees)",
+                        run.payroll_id, run.employee_count
+                    )),
+                    ..Default::default()
+                });
+
+                if employer_social > rust_decimal::Decimal::ZERO {
+                    je.add_line(JournalEntryLine {
+                        line_number: 2,
+                        gl_account: pcg::expense_accounts::SOCIAL_SECURITY.to_string(),
+                        debit_amount: employer_social,
+                        reference: Some(run.payroll_id.clone()),
+                        text: Some("Cotisations employeur".to_string()),
+                        ..Default::default()
+                    });
+                }
+
+                let credit_line = if employer_social > rust_decimal::Decimal::ZERO {
+                    3
+                } else {
+                    2
+                };
+                je.add_line(JournalEntryLine {
+                    line_number: credit_line,
+                    gl_account: pcg::personnel_accounts::WAGES_PAYABLE.to_string(),
+                    credit_amount: run.total_employer_cost,
+                    reference: Some(run.payroll_id.clone()),
+                    ..Default::default()
+                });
+            } else {
+                // Generic: DR Salaries & Wages (6100), CR Payroll Clearing (9100)
+                je.add_line(JournalEntryLine {
+                    line_number: 1,
+                    gl_account: expense_accounts::SALARIES_WAGES.to_string(),
+                    debit_amount: run.total_gross,
+                    reference: Some(run.payroll_id.clone()),
+                    text: Some(format!(
+                        "Payroll {} ({} employees)",
+                        run.payroll_id, run.employee_count
+                    )),
+                    ..Default::default()
+                });
+
+                je.add_line(JournalEntryLine {
+                    line_number: 2,
+                    gl_account: suspense_accounts::PAYROLL_CLEARING.to_string(),
+                    credit_amount: run.total_gross,
+                    reference: Some(run.payroll_id.clone()),
+                    ..Default::default()
+                });
+            }
 
             jes.push(je);
         }
@@ -7194,6 +7356,43 @@ impl EnhancedOrchestrator {
                             bank.clone(),
                             amount,
                         ));
+                    } else if is_pcg && action.scheme_type == Some(SchemeType::ShadowPayroll) {
+                        // Shadow payroll (ghost employee) in PCG: include employer social charges.
+                        // Treat action.amount as gross salary; approximate employer charges at 40% of gross.
+                        let employer_rate = Decimal::new(40, 2); // 0.40
+                        let employer_social = amount * employer_rate;
+                        let total_credit = amount + employer_social;
+                        let mut line_no = 1;
+
+                        // Dr 641100 Salaires, appointements (gross)
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            salaries_wages.to_string(),
+                            amount,
+                        ));
+                        line_no += 1;
+
+                        // Dr 645100 Cotisations sociales (URSSAF) (employer social charges)
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            pcg::expense_accounts::SOCIAL_SECURITY.to_string(),
+                            employer_social,
+                        ));
+                        line_no += 1;
+
+                        // Cr 421000 Personnel – Rémunérations dues (total employer cost), with auxiliary if available
+                        let credit_line = with_aux(
+                            JournalEntryLine::credit(
+                                action.scheme_id,
+                                line_no,
+                                wages_payable.to_string(),
+                                total_credit,
+                            ),
+                            wages_payable.as_str(),
+                        );
+                        entry.add_line(credit_line);
                     } else {
                         entry.add_line(JournalEntryLine::debit(
                             action.scheme_id,
@@ -7207,6 +7406,44 @@ impl EnhancedOrchestrator {
                             credit_acct.to_string(),
                             amount,
                         ));
+                    }
+                }
+                // Payment-type scheme actions: optionally split into multiple smaller payments
+                // within the same document to mimic multipayment behavior.
+                SchemeActionType::CreateFraudulentPayment
+                | SchemeActionType::MakeKickbackPayment => {
+                    // Deterministic "random" split based on action_id.
+                    let hash = action.action_id.as_u128() % 10;
+                    let parts = if hash < 3 {
+                        // 30% of cases → three-way split
+                        let third = (amount / Decimal::from(3u32)).round_dp(2);
+                        let two_thirds = (third * Decimal::from(2u32)).round_dp(2);
+                        vec![third, third, amount - two_thirds]
+                    } else if hash < 6 {
+                        // 30% of cases → two-way split
+                        let half = (amount / Decimal::from(2u32)).round_dp(2);
+                        vec![half, amount - half]
+                    } else {
+                        // 40% of cases → single payment (no split)
+                        vec![amount]
+                    };
+
+                    let mut line_no = 1;
+                    for part in parts {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            line_no,
+                            debit_acct.to_string(),
+                            part,
+                        ));
+                        line_no += 1;
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            line_no,
+                            credit_acct.to_string(),
+                            part,
+                        ));
+                        line_no += 1;
                     }
                 }
                 // Default: a simple 2-line balanced entry (generic accounts).
