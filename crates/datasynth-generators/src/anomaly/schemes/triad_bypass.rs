@@ -10,7 +10,7 @@
 //! - Stage 1 (bypass): emits 2–4 ReuseDocumentId actions per month against the same invoice.
 //! - Stage 2 (concealment): emits BypassConcealment correcting reversals.
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, Duration};
 use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -237,8 +237,12 @@ impl FraudScheme for TriadBypassScheme {
                     self.last_bypass_month = Some(current_month);
                     let target = rng.random_range(2u32..=4u32);
                     self.reuses_this_month = 0;
-                    // Emit all reuses for this month on first advance of the month
-                    for _ in 0..target {
+                    // Emit all reuses for this month on first advance of the month.
+                    // Use slightly different posting dates within the month so that
+                    // each ReuseDocumentId action gets a unique action_id / document_id.
+                    for i in 0..target {
+                        let action_date =
+                            context.current_date + Duration::days(i as i64);
                         let amount = context
                             // Use fingerprint distribution so payment amounts are in-distribution (not easy outliers)
                             .sample_amount_from_fingerprint(rng, Some("6XXX"))
@@ -247,7 +251,7 @@ impl FraudScheme for TriadBypassScheme {
                             self.scheme_id,
                             stage.stage_number,
                             SchemeActionType::ReuseDocumentId,
-                            context.current_date,
+                            action_date,
                         )
                         .with_scheme_type(self.scheme_type())
                         .with_amount(amount)

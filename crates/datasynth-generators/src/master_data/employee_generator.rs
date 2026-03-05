@@ -250,6 +250,7 @@ impl EmployeeGenerator {
 
         // Set dates
         employee.hire_date = Some(hire_date);
+        employee.creation_date = Some(hire_date);
 
         // Set approval limits based on job level
         employee.approval_limit = approval_limit;

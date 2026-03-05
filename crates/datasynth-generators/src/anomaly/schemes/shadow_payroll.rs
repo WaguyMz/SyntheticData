@@ -243,11 +243,18 @@ impl FraudScheme for ShadowPayrollScheme {
             // Stage 0: ghost hire — emit once
             0 => {
                 if !self.hire_emitted {
+                    // Create the ghost employee slightly before the scheme starts so
+                    // the HR master record creation date is close to the scheme start.
+                    let hire_date = self
+                        .start_date
+                        .map(|d| d - chrono::Months::new(1))
+                        .unwrap_or(context.current_date);
+
                     let action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,
                         SchemeActionType::GhostHire,
-                        context.current_date,
+                        hire_date,
                     )
                     .with_scheme_type(self.scheme_type())
                     .with_user(&self.perpetrator_id)

@@ -598,6 +598,10 @@ pub struct Customer {
     /// Customer account number in sub-ledger
     pub account_number: Option<String>,
 
+    /// Bank accounts for customer payments and refunds
+    #[serde(default)]
+    pub bank_accounts: Vec<BankAccount>,
+
     /// Typical order amount range (min, max)
     pub typical_order_range: (Decimal, Decimal),
 
@@ -664,6 +668,7 @@ impl Customer {
             payment_behavior: CustomerPaymentBehavior::default(),
             is_active: true,
             account_number: None,
+            bank_accounts: Vec::new(),
             typical_order_range: (Decimal::from(500), Decimal::from(50000)),
             is_intercompany: false,
             intercompany_code: None,
@@ -754,6 +759,14 @@ impl Customer {
     pub fn with_currency(mut self, currency: &str) -> Self {
         self.currency = currency.to_string();
         self
+    }
+
+    /// Get the primary bank account (if any).
+    pub fn primary_bank_account(&self) -> Option<&BankAccount> {
+        self.bank_accounts
+            .iter()
+            .find(|a| a.is_primary)
+            .or_else(|| self.bank_accounts.first())
     }
 
     /// Set sales organization.

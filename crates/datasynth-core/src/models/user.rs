@@ -620,6 +620,10 @@ pub struct Employee {
     /// Authorized transaction codes
     pub transaction_codes: Vec<TransactionCodeAuth>,
 
+    /// Creation date of the HR master record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_date: Option<chrono::NaiveDate>,
+
     /// Hire date
     pub hire_date: Option<chrono::NaiveDate>,
 
@@ -692,6 +696,7 @@ impl Employee {
             can_release_payment: false,
             system_roles: Vec::new(),
             transaction_codes: Vec::new(),
+            creation_date: None,
             hire_date: None,
             termination_date: None,
             location: None,

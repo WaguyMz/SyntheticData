@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use chrono::NaiveDate;
 use datasynth_core::models::{
-    ChurnReason, CreditRating, Customer, CustomerEngagement, CustomerLifecycleStage,
+    BankAccount, ChurnReason, CreditRating, Customer, CustomerEngagement, CustomerLifecycleStage,
     CustomerPaymentBehavior, CustomerPool, CustomerValueSegment, PaymentTerms, RiskTrigger,
     SegmentedCustomer, SegmentedCustomerPool,
 };
@@ -39,6 +39,10 @@ pub struct CustomerGeneratorConfig {
     pub default_currency: String,
     /// Credit limit ranges by rating (min, max)
     pub credit_limits: Vec<(CreditRating, Decimal, Decimal)>,
+    /// Generate bank accounts for customers
+    pub generate_bank_accounts: bool,
+    /// Probability of customer having multiple bank accounts
+    pub multiple_bank_account_rate: f64,
 }
 
 impl Default for CustomerGeneratorConfig {
@@ -109,6 +113,8 @@ impl Default for CustomerGeneratorConfig {
                 ),
                 (CreditRating::D, Decimal::from(0), Decimal::from(10_000)),
             ],
+            generate_bank_accounts: true,
+            multiple_bank_account_rate: 0.10,
         }
     }
 }
@@ -516,6 +522,17 @@ impl CustomerGenerator {
         // Set payment terms
         customer.payment_terms = self.select_payment_terms();
 
+        // Generate bank accounts for customer payments/refunds
+        if self.config.generate_bank_accounts {
+            let primary = self.generate_bank_account(&customer.customer_id);
+            customer.bank_accounts.push(primary);
+
+            if self.rng.random::<f64>() < self.config.multiple_bank_account_rate {
+                let secondary = self.generate_bank_account(&customer.customer_id);
+                customer.bank_accounts.push(secondary);
+            }
+        }
+
         // Set auxiliary GL account based on accounting framework
         customer.auxiliary_gl_account = self.generate_auxiliary_gl_account();
 
@@ -528,6 +545,26 @@ impl CustomerGenerator {
         // Note: address, contact_name, contact_email are not fields on Customer
 
         customer
+    }
+
+    /// Generate a deterministic-looking bank account for a customer.
+    fn generate_bank_account(&mut self, customer_id: &str) -> BankAccount {
+        // Simple IBAN-like pattern for demonstration purposes.
+        let bank = self.rng.random_range(10000u32..99999u32);
+        let branch = self.rng.random_range(10000u32..99999u32);
+        let acct = self.rng.random_range(10000000000u64..99999999999u64);
+        let iban = format!("FR76{:05}{:05}{:011}", bank, branch, acct);
+        let bic = "CUSTFRXXX".to_string();
+        let bank_name = "Customer Bank".to_string();
+
+        BankAccount {
+            bank_name,
+            bank_country: self.config.default_country.clone(),
+            account_number: iban,
+            routing_code: bic,
+            holder_name: customer_id.to_string(),
+            is_primary: true,
+        }
     }
 
     /// Generate an intercompany customer (always intercompany).

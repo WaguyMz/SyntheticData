@@ -6413,7 +6413,7 @@ impl EnhancedOrchestrator {
             AnomalyRateConfig::default().process_issue_rate
         };
 
-        let ai = &self.config.anomaly_injection;
+        let ai = self.config.anomaly_injection.clone();
         let schemes = &ai.multi_stage_schemes;
         let enhanced = EnhancedInjectionConfig {
             multi_stage_schemes_enabled: schemes.enabled,
@@ -6662,6 +6662,12 @@ impl EnhancedOrchestrator {
                 .or_insert(0) += 1;
         }
 
+        // For shadow payroll schemes, materialize ghost employees in master data so that
+        // the ghost HR records share the same bank account as the perpetrator.
+        if !scheme_actions.is_empty() {
+            self.materialize_shadow_payroll_ghost_employees(&scheme_actions);
+        }
+
         // Materialize scheme actions into journal entries (one balanced JE per action).
         // This ensures every scheme instance has at least one concrete transaction in journal_entries.csv.
         if !scheme_actions.is_empty() {
@@ -6712,6 +6718,74 @@ impl EnhancedOrchestrator {
             summary: Some(result.summary),
             by_type,
         })
+    }
+
+    /// For shadow payroll schemes, create ghost employee records in master data whose bank
+    /// accounts are identical to the perpetrator's payroll account. This makes the ghost
+    /// account share the same IBAN/BIC as the perpetrator, as expected for shadow payroll.
+    fn materialize_shadow_payroll_ghost_employees(&mut self, scheme_actions: &[SchemeAction]) {
+        if self.master_data.employees.is_empty() {
+            return;
+        }
+
+        // Map user_id → index into employees for quick perpetrator lookup.
+        let mut user_index: HashMap<String, usize> = HashMap::new();
+        for (idx, emp) in self.master_data.employees.iter().enumerate() {
+            user_index.insert(emp.user_id.clone(), idx);
+        }
+
+        // Track which ghost employee ids we have already created.
+        let mut created: HashSet<String> = HashSet::new();
+
+        for action in scheme_actions {
+            if action.action_type != SchemeActionType::GhostHire {
+                continue;
+            }
+            // Only handle shadow payroll schemes.
+            if !matches!(action.scheme_type, Some(SchemeType::ShadowPayroll)) {
+                continue;
+            }
+
+            let ghost_employee_id = match &action.reference {
+                Some(r) if !r.is_empty() => r.clone(),
+                _ => continue,
+            };
+            if created.contains(&ghost_employee_id) {
+                continue;
+            }
+
+            let perpetrator_user_id = match &action.user_id {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => continue,
+            };
+
+            let perpetrator_idx = match user_index.get(&perpetrator_user_id) {
+                Some(idx) => *idx,
+                None => continue,
+            };
+            let perpetrator = &self.master_data.employees[perpetrator_idx];
+
+            let perpetrator_bank = match &perpetrator.bank_account {
+                Some(b) => b.clone(),
+                None => continue,
+            };
+
+            let mut ghost = perpetrator.clone();
+            ghost.employee_id = ghost_employee_id.clone();
+            // Ensure user_id is distinct but clearly linked.
+            ghost.user_id = format!("ghost-{}", perpetrator.user_id);
+            ghost.display_name = format!("Ghost {}", perpetrator.display_name);
+            // Creation/hire date aligned with GhostHire action date.
+            ghost.hire_date = Some(action.target_date);
+            ghost.creation_date = Some(action.target_date);
+            // Explicitly mark as fraud actor.
+            ghost.is_fraud_actor = true;
+            // Critical: share the exact same bank account as the perpetrator.
+            ghost.bank_account = Some(perpetrator_bank);
+
+            self.master_data.employees.push(ghost);
+            created.insert(ghost_employee_id);
+        }
     }
 
     /// Scheme-relevant GL accounts (AP, AR, bank, expense, revenue) resolved from CoA
@@ -6835,6 +6909,15 @@ impl EnhancedOrchestrator {
         let mut out = Vec::with_capacity(actions.len());
 
         for action in actions {
+            // Admin-only shadow payroll actions (GhostHire / GhostTermination) should not
+            // create journal entries. They are represented in labels but have no JE in reality.
+            if matches!(
+                action.action_type,
+                SchemeActionType::GhostHire | SchemeActionType::GhostTermination
+            ) {
+                continue;
+            }
+
             let company = action
                 .company_code
                 .as_deref()
@@ -7584,6 +7667,49 @@ impl EnhancedOrchestrator {
                         credit_acct.to_string(),
                         amount,
                     ));
+                }
+            }
+
+            // Consolidate duplicate lines posting to the same GL account on the same side
+            // (debit or credit), keyed also by auxiliary account so AP/AR partners stay distinct.
+            if !entry.lines.is_empty() {
+                let mut merged: HashMap<(String, bool, Option<String>), JournalEntryLine> =
+                    HashMap::new();
+
+                for line in entry.lines.iter().cloned() {
+                    let is_debit = line.is_debit();
+                    let key = (
+                        line.gl_account.clone(),
+                        is_debit,
+                        line.auxiliary_account_number.clone(),
+                    );
+
+                    merged
+                        .entry(key)
+                        .and_modify(|acc| {
+                            acc.debit_amount += line.debit_amount;
+                            acc.credit_amount += line.credit_amount;
+                            acc.local_amount += line.local_amount;
+                            match (acc.group_amount, line.group_amount) {
+                                (Some(a1), Some(a2)) => acc.group_amount = Some(a1 + a2),
+                                (None, Some(a)) => acc.group_amount = Some(a),
+                                _ => {}
+                            }
+                        })
+                        .or_insert(line);
+                }
+
+                // Rebuild lines with normalized line numbers.
+                let mut consolidated: Vec<JournalEntryLine> = merged
+                    .into_values()
+                    .filter(|l| l.debit_amount != Decimal::ZERO || l.credit_amount != Decimal::ZERO)
+                    .collect();
+                consolidated.sort_by(|a, b| a.gl_account.cmp(&b.gl_account));
+
+                entry.lines.clear();
+                for (idx, mut line) in consolidated.into_iter().enumerate() {
+                    line.line_number = (idx as u32) + 1;
+                    entry.add_line(line);
                 }
             }
 
