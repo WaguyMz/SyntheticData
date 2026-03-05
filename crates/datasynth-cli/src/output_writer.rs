@@ -6,8 +6,15 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::collections::HashSet;
 
+use datasynth_config::schema::{
+    ForensicLlmOutputConfig, GnnSplitStrategy, GnnTrainingOutputConfig, OutputConfig,
+};
 use datasynth_runtime::enhanced_orchestrator::EnhancedGenerationResult;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use tracing::{info, warn};
 
 /// Write a JSON file for any serializable slice. Skips empty slices.
@@ -134,6 +141,197 @@ fn csv_opt_str(opt: &Option<String>) -> String {
     }
 }
 
+/// Write forensic LLM-oriented views (header/line tables) without any train/val/test split.
+fn write_forensic_llm_output(
+    result: &EnhancedGenerationResult,
+    output_dir: &Path,
+    cfg: &ForensicLlmOutputConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg.enabled || result.journal_entries.is_empty() {
+        return Ok(());
+    }
+
+    let dir = output_dir.join(&cfg.subdirectory);
+    std::fs::create_dir_all(&dir)?;
+    info!("Writing forensic LLM output to: {}", dir.display());
+
+    // Header-level table: one row per journal entry.
+    let header_path = dir.join("je_header.csv");
+    let header_file = std::fs::File::create(&header_path)?;
+    let mut hw = std::io::BufWriter::with_capacity(256 * 1024, header_file);
+
+    writeln!(
+        hw,
+        "document_id,company_code,fiscal_year,fiscal_period,posting_date,document_date,\
+         document_type,currency,exchange_rate,reference,header_text,created_by,source,\
+         business_process,ledger,is_fraud,is_anomaly"
+    )?;
+
+    for je in &result.journal_entries {
+        let h = &je.header;
+        writeln!(
+            hw,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            h.document_id,
+            csv_escape(&h.company_code),
+            h.fiscal_year,
+            h.fiscal_period,
+            h.posting_date,
+            h.document_date,
+            csv_escape(&h.document_type),
+            csv_escape(&h.currency),
+            h.exchange_rate,
+            csv_opt_str(&h.reference),
+            csv_opt_str(&h.header_text),
+            csv_escape(&h.created_by),
+            h.source,
+            h.business_process
+                .map(|bp| format!("{bp:?}"))
+                .unwrap_or_default(),
+            csv_escape(&h.ledger),
+            h.is_fraud,
+            h.is_anomaly,
+        )?;
+    }
+    hw.flush()?;
+
+    // Line-level table: one row per journal entry line.
+    let line_path = dir.join("je_line.csv");
+    let line_file = std::fs::File::create(&line_path)?;
+    let mut lw = std::io::BufWriter::with_capacity(256 * 1024, line_file);
+
+    writeln!(
+        lw,
+        "document_id,line_number,company_code,gl_account,debit_amount,credit_amount,local_amount,\
+         cost_center,profit_center,line_text,auxiliary_account_number,auxiliary_account_label,\
+         lettrage,lettrage_date,is_fraud,is_anomaly"
+    )?;
+
+    for je in &result.journal_entries {
+        let h = &je.header;
+        for line in &je.lines {
+            let lettrage_date_str = line
+                .lettrage_date
+                .map(|d| d.to_string())
+                .unwrap_or_default();
+            writeln!(
+                lw,
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                h.document_id,
+                line.line_number,
+                csv_escape(&h.company_code),
+                csv_escape(&line.gl_account),
+                line.debit_amount,
+                line.credit_amount,
+                line.local_amount,
+                csv_opt_str(&line.cost_center),
+                csv_opt_str(&line.profit_center),
+                csv_opt_str(&line.line_text),
+                csv_opt_str(&line.auxiliary_account_number),
+                csv_opt_str(&line.auxiliary_account_label),
+                csv_opt_str(&line.lettrage),
+                lettrage_date_str,
+                h.is_fraud,
+                h.is_anomaly,
+            )?;
+        }
+    }
+    lw.flush()?;
+
+    Ok(())
+}
+
+/// Write GNN/GCN training datasets with train/validation/test splits.
+fn write_gnn_training_output(
+    result: &EnhancedGenerationResult,
+    output_dir: &Path,
+    cfg: &GnnTrainingOutputConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg.enabled || result.journal_entries.is_empty() {
+        return Ok(());
+    }
+
+    let dir = output_dir.join(&cfg.subdirectory);
+    std::fs::create_dir_all(&dir)?;
+    info!("Writing GNN training splits to: {}", dir.display());
+
+    let n = result.journal_entries.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    // Build index list and order it according to the chosen strategy.
+    let mut indices: Vec<usize> = (0..n).collect();
+    match cfg.split_strategy {
+        GnnSplitStrategy::ByDocument => {
+            // Deterministic RNG so splits are reproducible for a given generation run.
+            let mut rng = ChaCha8Rng::seed_from_u64(42);
+            indices.as_mut_slice().shuffle(&mut rng);
+        }
+        GnnSplitStrategy::ByTime => {
+            indices.sort_by_key(|&i| result.journal_entries[i].header.posting_date);
+        }
+    }
+
+    // Compute split sizes; ensure they sum to n with test as the remainder.
+    let train_size = ((cfg.train_ratio.max(0.0).min(1.0)) * n as f32).floor() as usize;
+    let val_size = ((cfg.val_ratio.max(0.0).min(1.0)) * n as f32).floor() as usize;
+    let capped_train = train_size.min(n);
+    let capped_val = val_size.min(n.saturating_sub(capped_train));
+    let capped_test = n.saturating_sub(capped_train + capped_val);
+
+    let (train_idx, rest) = indices.split_at(capped_train);
+    let (val_idx, test_idx) = rest.split_at(capped_val);
+
+    // Helper to write a single split.
+    let write_split = |name: &str,
+                       idxs: &[usize]|
+     -> Result<(), Box<dyn std::error::Error>> {
+        if idxs.is_empty() {
+            return Ok(());
+        }
+        let split_dir = dir.join(name);
+        std::fs::create_dir_all(&split_dir)?;
+
+        // Journal entries for this split.
+        let split_entries: Vec<_> = idxs
+            .iter()
+            .map(|&i| result.journal_entries[i].clone())
+            .collect();
+        write_json(
+            &split_entries,
+            &split_dir.join("journal_entries.json"),
+            &format!("GNN journal entries ({name})"),
+        )?;
+
+        // Restrict anomaly labels to documents present in this split.
+        let doc_ids: HashSet<String> = split_entries
+            .iter()
+            .map(|je| je.header.document_id.to_string())
+            .collect();
+        let split_labels: Vec<_> = result
+            .anomaly_labels
+            .labels
+            .iter()
+            .cloned()
+            .filter(|lbl| doc_ids.contains(&lbl.document_id))
+            .collect();
+        write_json(
+            &split_labels,
+            &split_dir.join("anomaly_labels.json"),
+            &format!("GNN anomaly labels ({name})"),
+        )?;
+
+        Ok(())
+    };
+
+    write_split("train", train_idx)?;
+    write_split("val", val_idx)?;
+    write_split("test", test_idx)?;
+
+    Ok(())
+}
+
 /// Write all generated data to the output directory.
 ///
 /// This function exports every non-empty dataset from the generation result.
@@ -143,6 +341,7 @@ fn csv_opt_str(opt: &Option<String>) -> String {
 pub fn write_all_output(
     result: &EnhancedGenerationResult,
     output_dir: &Path,
+    output_config: &OutputConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir)?;
     info!("Writing comprehensive output to: {}", output_dir.display());
@@ -162,6 +361,28 @@ pub fn write_all_output(
             &output_dir.join("journal_entries.json"),
             "Journal entries (JSON)",
         )?;
+
+        // Optional forensic LLM-oriented exports (no train/val/test split).
+        if output_config.output_for_forensic_llm.enabled {
+            if let Err(e) = write_forensic_llm_output(
+                result,
+                output_dir,
+                &output_config.output_for_forensic_llm,
+            ) {
+                warn!("Failed to write forensic LLM output: {}", e);
+            }
+        }
+
+        // Optional GNN/GCN training exports with train/val/test splits.
+        if output_config.output_for_gnn_training.enabled {
+            if let Err(e) = write_gnn_training_output(
+                result,
+                output_dir,
+                &output_config.output_for_gnn_training,
+            ) {
+                warn!("Failed to write GNN training output: {}", e);
+            }
+        }
     }
 
     // ========================================================================

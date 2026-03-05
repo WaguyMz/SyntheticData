@@ -1410,6 +1410,12 @@ pub struct OutputConfig {
     /// Partition by company code
     #[serde(default)]
     pub partition_by_company: bool,
+    /// Optional convenience exports for forensic LLM experiments.
+    #[serde(default)]
+    pub output_for_forensic_llm: ForensicLlmOutputConfig,
+    /// Optional convenience exports for GNN/GCN training.
+    #[serde(default)]
+    pub output_for_gnn_training: GnnTrainingOutputConfig,
 }
 
 fn default_formats() -> Vec<FileFormat> {
@@ -1431,7 +1437,101 @@ impl Default for OutputConfig {
             include_bseg: false,
             partition_by_period: true,
             partition_by_company: false,
+            output_for_forensic_llm: ForensicLlmOutputConfig::default(),
+            output_for_gnn_training: GnnTrainingOutputConfig::default(),
         }
+    }
+}
+
+/// Forensic LLM-oriented output configuration (SQL/dataframe friendly views).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicLlmOutputConfig {
+    /// Enable forensic LLM exports.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Subdirectory under the main output directory.
+    #[serde(default = "default_forensic_llm_subdir")]
+    pub subdirectory: String,
+}
+
+fn default_forensic_llm_subdir() -> String {
+    "forensic_llm".to_string()
+}
+
+impl Default for ForensicLlmOutputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            subdirectory: default_forensic_llm_subdir(),
+        }
+    }
+}
+
+/// GNN/GCN training-oriented output configuration with dataset splits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GnnTrainingOutputConfig {
+    /// Enable GNN training exports.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Subdirectory under the main output directory.
+    #[serde(default = "default_gnn_training_subdir")]
+    pub subdirectory: String,
+    /// Train split ratio (0.0–1.0).
+    #[serde(default = "default_gnn_train_ratio")]
+    pub train_ratio: f32,
+    /// Validation split ratio (0.0–1.0).
+    #[serde(default = "default_gnn_val_ratio")]
+    pub val_ratio: f32,
+    /// Test split ratio (0.0–1.0).
+    #[serde(default = "default_gnn_test_ratio")]
+    pub test_ratio: f32,
+    /// Split strategy for journal entries.
+    #[serde(default)]
+    pub split_strategy: GnnSplitStrategy,
+}
+
+fn default_gnn_training_subdir() -> String {
+    "gnn_training".to_string()
+}
+
+fn default_gnn_train_ratio() -> f32 {
+    0.7
+}
+
+fn default_gnn_val_ratio() -> f32 {
+    0.15
+}
+
+fn default_gnn_test_ratio() -> f32 {
+    0.15
+}
+
+impl Default for GnnTrainingOutputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            subdirectory: default_gnn_training_subdir(),
+            train_ratio: default_gnn_train_ratio(),
+            val_ratio: default_gnn_val_ratio(),
+            test_ratio: default_gnn_test_ratio(),
+            split_strategy: GnnSplitStrategy::ByTime,
+        }
+    }
+}
+
+/// Strategies for splitting journal entries into train/validation/test.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GnnSplitStrategy {
+    /// Randomized split by document (reproducible with fixed RNG).
+    ByDocument,
+    /// Chronological split by posting_date (earliest = train, latest = test).
+    ByTime,
+}
+
+impl Default for GnnSplitStrategy {
+    fn default() -> Self {
+        GnnSplitStrategy::ByTime
     }
 }
 
