@@ -238,6 +238,439 @@ fn write_forensic_llm_output(
     }
     lw.flush()?;
 
+    // Master data and labels for SQL-style provisioning.
+    write_forensic_employees_csv(result, &dir)?;
+    write_forensic_vendors_csv(result, &dir)?;
+    write_forensic_customers_csv(result, &dir)?;
+    write_forensic_anomaly_labels_csv(result, &dir)?;
+    write_forensic_sql_provisioning(result, &dir)?;
+
+    Ok(())
+}
+
+fn write_forensic_employees_csv(
+    result: &EnhancedGenerationResult,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if result.master_data.employees.is_empty() {
+        return Ok(());
+    }
+    let path = dir.join("employees.csv");
+    let file = std::fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+    writeln!(
+        w,
+        "employee_id,user_id,display_name,first_name,last_name,email,company_code,\
+         department_id,cost_center,manager_id,status,hire_date,termination_date,creation_date,location,\
+         payroll_bank_name,payroll_bank_country,payroll_account_number,payroll_routing_code,\
+         is_fraud_actor"
+    )?;
+
+    for e in &result.master_data.employees {
+        let hire_date = e.hire_date.map(|d| d.to_string()).unwrap_or_default();
+        let term_date = e
+            .termination_date
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let creation_date = e
+            .creation_date
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        let (bank_name, bank_country, account_number, routing_code) = match &e.bank_account {
+            Some(acc) => (
+                csv_escape(&acc.bank_name),
+                csv_escape(&acc.bank_country),
+                csv_escape(&acc.account_number),
+                csv_escape(&acc.routing_code),
+            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
+
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            csv_escape(&e.employee_id),
+            csv_escape(&e.user_id),
+            csv_escape(&e.display_name),
+            csv_escape(&e.first_name),
+            csv_escape(&e.last_name),
+            csv_escape(&e.email),
+            csv_escape(&e.company_code),
+            csv_opt_str(&e.department_id),
+            csv_opt_str(&e.cost_center),
+            csv_opt_str(&e.manager_id),
+            format!("{:?}", e.status),
+            hire_date,
+            term_date,
+            creation_date,
+            csv_opt_str(&e.location),
+            bank_name,
+            bank_country,
+            account_number,
+            routing_code,
+            e.is_fraud_actor,
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn write_forensic_vendors_csv(
+    result: &EnhancedGenerationResult,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if result.master_data.vendors.is_empty() {
+        return Ok(());
+    }
+    let path = dir.join("vendors.csv");
+    let file = std::fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+    writeln!(
+        w,
+        "vendor_id,name,country,account_number,tax_id,currency,reconciliation_account,\
+         auxiliary_gl_account,is_intercompany,behavior,payment_terms,is_fraud_actor,\
+         bank_account_count,primary_bank_name,primary_bank_country,primary_account_number,primary_routing_code"
+    )?;
+
+    for v in &result.master_data.vendors {
+        let (bank_count, bank_name, bank_country, account_number, routing_code) =
+            if v.bank_accounts.is_empty() {
+                (0usize, String::new(), String::new(), String::new(), String::new())
+            } else {
+                let primary = v
+                    .bank_accounts
+                    .iter()
+                    .find(|b| b.is_primary)
+                    .unwrap_or(&v.bank_accounts[0]);
+                (
+                    v.bank_accounts.len(),
+                    csv_escape(&primary.bank_name),
+                    csv_escape(&primary.bank_country),
+                    csv_escape(&primary.account_number),
+                    csv_escape(&primary.routing_code),
+                )
+            };
+
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            csv_escape(&v.vendor_id),
+            csv_escape(&v.name),
+            csv_escape(&v.country),
+            csv_opt_str(&v.account_number),
+            csv_opt_str(&v.tax_id),
+            csv_escape(&v.currency),
+            csv_opt_str(&v.reconciliation_account),
+            csv_opt_str(&v.auxiliary_gl_account),
+            v.is_intercompany,
+            format!("{:?}", v.behavior),
+            v.payment_terms.code(),
+            v.is_fraud_actor,
+            bank_count,
+            bank_name,
+            bank_country,
+            account_number,
+            routing_code,
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn write_forensic_customers_csv(
+    result: &EnhancedGenerationResult,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if result.master_data.customers.is_empty() {
+        return Ok(());
+    }
+    let path = dir.join("customers.csv");
+    let file = std::fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+    writeln!(
+        w,
+        "customer_id,name,country,account_number,tax_id,currency,reconciliation_account,\
+         auxiliary_gl_account,is_intercompany,credit_rating,is_fraud_actor,\
+         bank_account_count,primary_bank_name,primary_bank_country,primary_account_number,primary_routing_code"
+    )?;
+
+    for c in &result.master_data.customers {
+        let (bank_count, bank_name, bank_country, account_number, routing_code) =
+            if c.bank_accounts.is_empty() {
+                (0usize, String::new(), String::new(), String::new(), String::new())
+            } else {
+                let primary = c
+                    .bank_accounts
+                    .iter()
+                    .find(|b| b.is_primary)
+                    .unwrap_or(&c.bank_accounts[0]);
+                (
+                    c.bank_accounts.len(),
+                    csv_escape(&primary.bank_name),
+                    csv_escape(&primary.bank_country),
+                    csv_escape(&primary.account_number),
+                    csv_escape(&primary.routing_code),
+                )
+            };
+
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            csv_escape(&c.customer_id),
+            csv_escape(&c.name),
+            csv_escape(&c.country),
+            csv_opt_str(&c.account_number),
+            csv_opt_str(&c.tax_id),
+            csv_escape(&c.currency),
+            csv_opt_str(&c.reconciliation_account),
+            csv_opt_str(&c.auxiliary_gl_account),
+            c.is_intercompany,
+            format!("{:?}", c.credit_rating),
+            c.is_fraud_actor,
+            bank_count,
+            bank_name,
+            bank_country,
+            account_number,
+            routing_code,
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn write_forensic_anomaly_labels_csv(
+    result: &EnhancedGenerationResult,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if result.anomaly_labels.labels.is_empty() {
+        return Ok(());
+    }
+    let path = dir.join("anomaly_labels.csv");
+    let file = std::fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+    writeln!(
+        w,
+        "anomaly_id,anomaly_type,document_id,document_type,company_code,anomaly_date,\
+         detection_timestamp,confidence,severity,description,monetary_impact,is_injected"
+    )?;
+
+    for lbl in &result.anomaly_labels.labels {
+        let impact = lbl
+            .monetary_impact
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            csv_escape(&lbl.anomaly_id),
+            format!("{:?}", lbl.anomaly_type),
+            csv_escape(&lbl.document_id),
+            csv_escape(&lbl.document_type),
+            csv_escape(&lbl.company_code),
+            lbl.anomaly_date,
+            lbl.detection_timestamp,
+            lbl.confidence,
+            lbl.severity,
+            csv_escape(&lbl.description),
+            impact,
+            lbl.is_injected,
+        )?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Write a companion SQL file with DDL + COPY commands to load the forensic
+/// CSVs into a relational database (e.g., PostgreSQL, DuckDB).
+fn write_forensic_sql_provisioning(
+    result: &EnhancedGenerationResult,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = dir.join("forensic_llm.sql");
+    let file = std::fs::File::create(&path)?;
+    let mut w = std::io::BufWriter::with_capacity(128 * 1024, file);
+
+    writeln!(
+        w,
+        "-- Forensic LLM schema and bulk-load commands.\n\
+         -- Run from the directory containing the CSVs (forensic_llm/).\n"
+    )?;
+
+    if !result.journal_entries.is_empty() {
+        // Header table
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS je_header (\n\
+             \tdocument_id UUID PRIMARY KEY,\n\
+             \tcompany_code TEXT,\n\
+             \tfiscal_year INT,\n\
+             \tfiscal_period INT,\n\
+             \tposting_date DATE,\n\
+             \tdocument_date DATE,\n\
+             \tdocument_type TEXT,\n\
+             \tcurrency TEXT,\n\
+             \texchange_rate NUMERIC,\n\
+             \treference TEXT,\n\
+             \theader_text TEXT,\n\
+             \tcreated_by TEXT,\n\
+             \tsource TEXT,\n\
+             \tbusiness_process TEXT,\n\
+             \tledger TEXT,\n\
+             \tis_fraud BOOLEAN,\n\
+             \tis_anomaly BOOLEAN\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY je_header FROM 'je_header.csv' CSV HEADER;\n"
+        )?;
+
+        // Line table
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS je_line (\n\
+             \tdocument_id UUID REFERENCES je_header(document_id),\n\
+             \tline_number INT,\n\
+             \tcompany_code TEXT,\n\
+             \tgl_account TEXT,\n\
+             \tdebit_amount NUMERIC,\n\
+             \tcredit_amount NUMERIC,\n\
+             \tlocal_amount NUMERIC,\n\
+             \tcost_center TEXT,\n\
+             \tprofit_center TEXT,\n\
+             \tline_text TEXT,\n\
+             \tauxiliary_account_number TEXT,\n\
+             \tauxiliary_account_label TEXT,\n\
+             \tlettrage TEXT,\n\
+             \tlettrage_date DATE,\n\
+             \tis_fraud BOOLEAN,\n\
+             \tis_anomaly BOOLEAN\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY je_line FROM 'je_line.csv' CSV HEADER;\n"
+        )?;
+    }
+
+    if !result.master_data.employees.is_empty() {
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS employees (\n\
+             \temployee_id TEXT PRIMARY KEY,\n\
+             \tuser_id TEXT,\n\
+             \tdisplay_name TEXT,\n\
+             \tfirst_name TEXT,\n\
+             \tlast_name TEXT,\n\
+             \temail TEXT,\n\
+             \tcompany_code TEXT,\n\
+             \tdepartment_id TEXT,\n\
+             \tcost_center TEXT,\n\
+             \tmanager_id TEXT,\n\
+             \tstatus TEXT,\n\
+             \thire_date DATE,\n\
+             \ttermination_date DATE,\n\
+             \tcreation_date DATE,\n\
+             \tlocation TEXT,\n\
+             \tpayroll_bank_name TEXT,\n\
+             \tpayroll_bank_country TEXT,\n\
+             \tpayroll_account_number TEXT,\n\
+             \tpayroll_routing_code TEXT,\n\
+             \tis_fraud_actor BOOLEAN\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY employees FROM 'employees.csv' CSV HEADER;\n"
+        )?;
+    }
+
+    if !result.master_data.vendors.is_empty() {
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS vendors (\n\
+             \tvendor_id TEXT PRIMARY KEY,\n\
+             \tname TEXT,\n\
+             \tcountry TEXT,\n\
+             \taccount_number TEXT,\n\
+             \ttax_id TEXT,\n\
+             \tcurrency TEXT,\n\
+             \treconciliation_account TEXT,\n\
+             \tauxiliary_gl_account TEXT,\n\
+             \tis_intercompany BOOLEAN,\n\
+             \tbehavior TEXT,\n\
+             \tpayment_terms TEXT,\n\
+             \tis_fraud_actor BOOLEAN,\n\
+             \tbank_account_count INT,\n\
+             \tprimary_bank_name TEXT,\n\
+             \tprimary_bank_country TEXT,\n\
+             \tprimary_account_number TEXT,\n\
+             \tprimary_routing_code TEXT\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY vendors FROM 'vendors.csv' CSV HEADER;\n"
+        )?;
+    }
+
+    if !result.master_data.customers.is_empty() {
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS customers (\n\
+             \tcustomer_id TEXT PRIMARY KEY,\n\
+             \tname TEXT,\n\
+             \tcountry TEXT,\n\
+             \taccount_number TEXT,\n\
+             \ttax_id TEXT,\n\
+             \tcurrency TEXT,\n\
+             \treconciliation_account TEXT,\n\
+             \tauxiliary_gl_account TEXT,\n\
+             \tis_intercompany BOOLEAN,\n\
+             \tcredit_rating TEXT,\n\
+             \tis_fraud_actor BOOLEAN,\n\
+             \tbank_account_count INT,\n\
+             \tprimary_bank_name TEXT,\n\
+             \tprimary_bank_country TEXT,\n\
+             \tprimary_account_number TEXT,\n\
+             \tprimary_routing_code TEXT\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY customers FROM 'customers.csv' CSV HEADER;\n"
+        )?;
+    }
+
+    if !result.anomaly_labels.labels.is_empty() {
+        writeln!(
+            w,
+            "CREATE TABLE IF NOT EXISTS anomaly_labels (\n\
+             \tanomaly_id TEXT PRIMARY KEY,\n\
+             \tanomaly_type TEXT,\n\
+             \tdocument_id TEXT,\n\
+             \tdocument_type TEXT,\n\
+             \tcompany_code TEXT,\n\
+             \tanomaly_date DATE,\n\
+             \tdetection_timestamp TIMESTAMP,\n\
+             \tconfidence DOUBLE PRECISION,\n\
+             \tseverity INT,\n\
+             \tdescription TEXT,\n\
+             \tmonetary_impact NUMERIC,\n\
+             \tis_injected BOOLEAN\n\
+             );\n"
+        )?;
+        writeln!(
+            w,
+            "COPY anomaly_labels FROM 'anomaly_labels.csv' CSV HEADER;\n"
+        )?;
+    }
+
+    w.flush()?;
     Ok(())
 }
 

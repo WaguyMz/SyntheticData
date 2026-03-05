@@ -40,6 +40,8 @@ ryu = { workspace = true }
 rayon = { workspace = true }
 num_cpus = { workspace = true }
 reqwest = { workspace = true, optional = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
 
 # Signal handling for pause/resume
 [target.'cfg(unix)'.dependencies]

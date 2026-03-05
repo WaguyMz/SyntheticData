@@ -7078,6 +7078,14 @@ impl EnhancedOrchestrator {
                 entry.header.reference = Some(ref_str.clone());
             }
 
+            // All scheme-materialized entries are, by construction, part of a fraud scenario.
+            // Mark them as such so forensic consumers can rely on header.is_fraud.
+            entry.header.is_anomaly = true;
+            entry.header.is_fraud = true;
+            if let Some(st) = action.scheme_type {
+                entry.header.anomaly_type = Some(format!("{st:?}"));
+            }
+
             // Helper to set Compte aux. / Libellé aux. on AP/AR lines from counterparty and master data.
             let with_aux = |mut line: JournalEntryLine, gl: &str| {
                 if let Some(cp) = action.counterparty.as_ref() {
