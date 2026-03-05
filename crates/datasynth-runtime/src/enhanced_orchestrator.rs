@@ -6596,8 +6596,16 @@ impl EnhancedOrchestrator {
 
             let entries_per_attempt = schemes.entries_per_start_attempt.max(1);
             let max_starts_per_month = schemes.max_starts_per_company_per_month.max(1) as u64;
-            let month_starts: BTreeSet<(i32, u32)> =
-                date_company.iter().map(|(d, _)| (d.year(), d.month())).collect();
+            let month_starts: Vec<(i32, u32)> = date_company
+                .iter()
+                .map(|(d, _)| (d.year(), d.month()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            // Process month-by-month: start attempts for that month, then advance schemes
+            // through every day of that month. This (1) lets schemes complete and free
+            // capacity for later months, and (2) spreads starts across the timeline instead
+            // of bunching in month 1 when max_starts_per_month is high.
             for (y, m) in month_starts {
                 let first = NaiveDate::from_ymd_opt(y, m, 1).unwrap_or_else(|| {
                     NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
@@ -6633,15 +6641,17 @@ impl EnhancedOrchestrator {
                     }
                     debug!("Active scheme types: {:?}", by_type);
                 }
-            }
-            for (date, company_code) in date_company {
-                injector.advance_schemes(
-                    date,
-                    &company_code,
-                    users.clone(),
-                    accounts.clone(),
-                    counterparties.clone(),
-                );
+                // Advance all schemes through every (date, company) in this month so that
+                // completed schemes free capacity before the next month's start attempts.
+                for (date, company_code) in date_company.iter().filter(|(d, _)| d.year() == y && d.month() == m) {
+                    injector.advance_schemes(
+                        *date,
+                        company_code,
+                        users.clone(),
+                        accounts.clone(),
+                        counterparties.clone(),
+                    );
+                }
             }
         }
 

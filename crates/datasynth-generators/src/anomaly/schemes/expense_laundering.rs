@@ -15,7 +15,7 @@
 //!                   amount ∈ [base_max × 0.01, base_max × 0.10]
 //! - Stage 2: one `ShellVendorSettlement` per shell vendor + single `ConsolidationWire`.
 
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate};
 use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -239,12 +239,14 @@ impl FraudScheme for ExpenseLaunderingScheme {
             // Stage 0: emit CreateShellVendor for each shell vendor (once)
             0 => {
                 if !self.vendors_created {
-                    for vendor_id in &self.shell_vendors.clone() {
+                    for (idx, vendor_id) in self.shell_vendors.clone().iter().enumerate() {
+                        let action_date =
+                            context.current_date + Duration::days(idx as i64);
                         let action = SchemeAction::new(
                             self.scheme_id,
                             stage.stage_number,
                             SchemeActionType::CreateShellVendor,
-                            context.current_date,
+                            action_date,
                         )
                         .with_scheme_type(self.scheme_type())
                         .with_counterparty(vendor_id)
@@ -351,16 +353,18 @@ impl FraudScheme for ExpenseLaunderingScheme {
             // Stage 2: ShellVendorSettlement per vendor + ConsolidationWire
             2 => {
                 if !self.settlement_emitted {
-                    for vendor_id in &self.shell_vendors.clone() {
+                    for (idx, vendor_id) in self.shell_vendors.clone().iter().enumerate() {
                         // Use fingerprint distribution so settlement amounts are in-distribution (not easy outliers)
                         let settle_amount = context
                             .sample_amount_from_fingerprint(rng, Some("6XXX"))
                             .unwrap_or_else(|| stage.random_amount(rng));
+                        let action_date =
+                            context.current_date + Duration::days(idx as i64);
                         let action = SchemeAction::new(
                             self.scheme_id,
                             stage.stage_number,
                             SchemeActionType::ShellVendorSettlement,
-                            context.current_date,
+                            action_date,
                         )
                         .with_scheme_type(self.scheme_type())
                         .with_amount(settle_amount)
