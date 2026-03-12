@@ -3,7 +3,7 @@
 //! Models a classic embezzlement pattern where a perpetrator starts with small
 //! test amounts and gradually escalates over time.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -292,40 +292,79 @@ impl FraudScheme for GradualEmbezzlementScheme {
             && rng.random::<f64>() < 0.3; // Random chance
 
         if should_transact {
-            // Use fingerprint distribution when available so fraud amounts are in-distribution (not easy outliers)
             let amount = context
                 .sample_amount_from_fingerprint(rng, Some("6XXX"))
                 .unwrap_or_else(|| stage.random_amount(rng));
             let account = self.select_account(context, rng);
 
-            let mut action = SchemeAction::new(
+            let invoice_ref = format!(
+                "INV-SHELL-{:06X}",
+                (self.scheme_id.as_u128() ^ self.stage_transaction_count as u128) & 0xFFFFFF
+            );
+
+            // Stage 0/1: after-hours (22:00-06:00), Stage 2+: business hours
+            let time = if self.current_stage_index <= 1 {
+                let h = if rng.random::<bool>() {
+                    rng.random_range(22u32..24)
+                } else {
+                    rng.random_range(0u32..6)
+                };
+                let m = rng.random_range(0u32..60);
+                NaiveTime::from_hms_opt(h, m, 0).unwrap_or(NaiveTime::from_hms_opt(23, 0, 0).unwrap())
+            } else {
+                let h = rng.random_range(8u32..18);
+                let m = rng.random_range(0u32..60);
+                NaiveTime::from_hms_opt(h, m, 0).unwrap_or(NaiveTime::from_hms_opt(10, 0, 0).unwrap())
+            };
+
+            // Part A: Invoice (Dr Expense, Dr VAT, Cr AP)
+            let mut invoice_action = SchemeAction::new(
                 self.scheme_id,
                 stage.stage_number,
-                SchemeActionType::CreateFraudulentEntry,
+                SchemeActionType::EmbezzleInvoice,
                 context.current_date,
             )
             .with_scheme_type(self.scheme_type())
             .with_amount(amount)
             .with_user(&self.perpetrator_id)
             .with_difficulty(stage.detection_difficulty)
+            .with_reference(&invoice_ref)
+            .with_target_time(time)
             .with_description(format!(
-                "Embezzlement stage {} - {}",
+                "Embezzlement invoice stage {} - {}",
                 stage.stage_number, stage.name
             ));
 
             if let Some(acct) = account {
-                action = action.with_account(acct);
+                invoice_action = invoice_action.with_account(acct);
             }
-
-            // Add concealment techniques from stage
             for technique in &stage.concealment_techniques {
-                action = action.with_technique(*technique);
+                invoice_action = invoice_action.with_technique(*technique);
             }
+            actions.push(invoice_action);
+
+            // Part B: Payment (Dr AP, Cr Bank), T+15..T+30 days later
+            let payment_delay = rng.random_range(15i64..=30);
+            let payment_date = context.current_date + chrono::Duration::days(payment_delay);
+            let payment_action = SchemeAction::new(
+                self.scheme_id,
+                stage.stage_number,
+                SchemeActionType::EmbezzlePayment,
+                payment_date,
+            )
+            .with_scheme_type(self.scheme_type())
+            .with_amount(amount)
+            .with_user(&self.perpetrator_id)
+            .with_difficulty(stage.detection_difficulty)
+            .with_reference(&invoice_ref)
+            .with_description(format!(
+                "Embezzlement payment stage {} - {}",
+                stage.stage_number, stage.name
+            ));
+            actions.push(payment_action);
 
             self.stage_transaction_count += 1;
             self.days_since_last_transaction = 0;
-
-            actions.push(action);
         } else {
             self.days_since_last_transaction += 1;
         }

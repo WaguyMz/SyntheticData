@@ -30,6 +30,10 @@ fn pathology_taxonomy(scheme_type: SchemeType) -> (&'static str, &'static str) {
         CircularFunding => ("CircularFunding", "Relational"),
         PhantomWarehousing => ("PhantomWarehousing", "Relational"),
         IntercompanyWashTrades => ("IntercompanyWashTrades", "Relational"),
+        PayrollTaxDiversion => ("PayrollTaxDiversion", "Sequential"),
+        InventoryManipulation => ("InventoryManipulation", "Sequential"),
+        RelatedPartyAbuse => ("RelatedPartyAbuse", "Relational"),
+        CircularCashFlow => ("CircularCashFlow", "Volume"),
         RoundTripping | GhostEmployee | ExpenseReimbursement | InventoryTheft | Custom => {
             (scheme_type.name(), "Relational")
         }
@@ -37,9 +41,10 @@ fn pathology_taxonomy(scheme_type: SchemeType) -> (&'static str, &'static str) {
 }
 
 use super::schemes::{
-    ExpenseLaunderingScheme, FraudScheme, GradualEmbezzlementScheme, RevenueManipulationScheme,
-    SchemeAction, SchemeContext, ShadowPayrollScheme, SchemeStatus, TriadBypassScheme,
-    VendorKickbackScheme,
+    CircularCashFlowScheme, ExpenseLaunderingScheme, FraudScheme, GhostEmployeeRecord,
+    GradualEmbezzlementScheme, InventoryManipulationScheme, PayrollTaxDiversionScheme,
+    RelatedPartyScheme, RevenueManipulationScheme, SchemeAction, SchemeContext,
+    ShadowPayrollScheme, SchemeStatus, TriadBypassScheme, VendorKickbackScheme,
 };
 
 /// Configuration for scheme generation.
@@ -75,10 +80,26 @@ pub struct SchemeAdvancerConfig {
     pub phantom_warehousing_probability: f64,
     /// Probability of starting an intercompany wash trade scheme per period.
     pub intercompany_wash_trade_probability: f64,
+    /// Probability of starting a payroll tax diversion scheme per period.
+    pub payroll_tax_diversion_probability: f64,
+    /// Probability of starting an inventory manipulation scheme per period.
+    pub inventory_manipulation_probability: f64,
+    /// Probability of starting a related-party transaction scheme per period.
+    pub related_party_abuse_probability: f64,
+    /// Probability of starting a circular cash flow scheme per period.
+    pub circular_cash_flow_probability: f64,
     /// Maximum number of concurrent schemes **per scheme type**.
     pub max_concurrent_schemes: usize,
     /// Whether to allow the same perpetrator in multiple schemes.
     pub allow_repeat_perpetrators: bool,
+    /// Probability of assigning a new scheme to an already-active perpetrator
+    /// (only used when `allow_repeat_perpetrators` is true).
+    pub perpetrator_reuse_probability: f64,
+    /// Maximum schemes per perpetrator when reuse is active.
+    pub max_schemes_per_perpetrator: usize,
+    /// Co-occurrence: when scheme A fires, P(scheme B also fires with same perpetrator).
+    /// Key = (from_type, to_type), value = probability.
+    pub co_occurrence: HashMap<(SchemeType, SchemeType), f64>,
     /// Random seed for reproducibility.
     pub seed: u64,
 }
@@ -103,8 +124,15 @@ impl Default for SchemeAdvancerConfig {
             circular_funding_probability: 0.005,
             phantom_warehousing_probability: 0.005,
             intercompany_wash_trade_probability: 0.005,
+            payroll_tax_diversion_probability: 0.005,
+            inventory_manipulation_probability: 0.005,
+            related_party_abuse_probability: 0.005,
+            circular_cash_flow_probability: 0.005,
             max_concurrent_schemes: 5,
             allow_repeat_perpetrators: false,
+            perpetrator_reuse_probability: 0.0,
+            max_schemes_per_perpetrator: 3,
+            co_occurrence: HashMap::new(),
             seed: 42,
         }
     }
@@ -260,6 +288,22 @@ impl SchemeAdvancer {
             SchemeType::ExpenseLaundering,
             self.config.expense_laundering_probability,
         );
+        draw(
+            SchemeType::PayrollTaxDiversion,
+            self.config.payroll_tax_diversion_probability,
+        );
+        draw(
+            SchemeType::InventoryManipulation,
+            self.config.inventory_manipulation_probability,
+        );
+        draw(
+            SchemeType::RelatedPartyAbuse,
+            self.config.related_party_abuse_probability,
+        );
+        draw(
+            SchemeType::CircularCashFlow,
+            self.config.circular_cash_flow_probability,
+        );
         // Circular Funding, Phantom Warehousing, Intercompany Wash Trades are disabled
         // (Single-FEC scope: no multi-entity cyclical patterns).
 
@@ -270,7 +314,7 @@ impl SchemeAdvancer {
         // Avoid deterministic bias if many schemes fire in the same period.
         fired.shuffle(&mut self.rng);
 
-        let mut started: Vec<Uuid> = Vec::new();
+        let mut started: Vec<(Uuid, SchemeType, String)> = Vec::new();
         for scheme_type in fired {
             // Enforce a per-type **concurrency** cap only: at most
             // `max_concurrent_schemes` active instances of a given
@@ -289,12 +333,15 @@ impl SchemeAdvancer {
                 break;
             }
 
-            // Vendor kickback requires a vendor not already "active" in another kickback scheme.
+            // Vendor kickback requires a *vendor* (not a customer) that is not already "active"
+            // in another kickback scheme. Counterparty ids are prefixed (e.g. "V-000013", "C-000013"),
+            // so we explicitly restrict to `V-` here to avoid attaching customer auxiliaries (411xxx)
+            // to AP control account 401000.
             let vendor_for_kickback: Option<String> = if scheme_type == SchemeType::VendorKickback {
                 let available_vendors: Vec<_> = context
                     .available_counterparties
                     .iter()
-                    .filter(|v| !self.active_vendors.contains(v))
+                    .filter(|v| v.starts_with("V-") && !self.active_vendors.contains(v))
                     .cloned()
                     .collect();
                 if available_vendors.is_empty() {
@@ -306,10 +353,33 @@ impl SchemeAdvancer {
                 None
             };
 
-            let user_idx = self.rng.random_range(0..available_users.len());
-            let perpetrator = if self.config.allow_repeat_perpetrators {
+            let perpetrator = if self.config.allow_repeat_perpetrators
+                && self.config.perpetrator_reuse_probability > 0.0
+                && !self.active_perpetrators.is_empty()
+                && self.rng.random::<f64>() < self.config.perpetrator_reuse_probability
+            {
+                // Reuse an existing perpetrator (multi-scheme fraud network)
+                let eligible: Vec<_> = self.active_perpetrators.iter()
+                    .filter(|p| {
+                        let count = self.active_schemes.iter()
+                            .filter(|s| s.perpetrator_id() == p.as_str())
+                            .count();
+                        count < self.config.max_schemes_per_perpetrator
+                    })
+                    .cloned()
+                    .collect();
+                if eligible.is_empty() {
+                    let user_idx = self.rng.random_range(0..available_users.len());
+                    available_users[user_idx].clone()
+                } else {
+                    let idx = self.rng.random_range(0..eligible.len());
+                    eligible[idx].clone()
+                }
+            } else if self.config.allow_repeat_perpetrators {
+                let user_idx = self.rng.random_range(0..available_users.len());
                 available_users[user_idx].clone()
             } else {
+                let user_idx = self.rng.random_range(0..available_users.len());
                 available_users.swap_remove(user_idx)
             };
 
@@ -344,23 +414,82 @@ impl SchemeAdvancer {
                 SchemeType::TriadBypass => Box::new(TriadBypassScheme::new(scheme_id, &perpetrator)),
                 SchemeType::ShadowPayroll => Box::new(ShadowPayrollScheme::new(scheme_id, &perpetrator)),
                 SchemeType::ExpenseLaundering => Box::new(ExpenseLaunderingScheme::new(scheme_id, &perpetrator)),
+                SchemeType::PayrollTaxDiversion => Box::new(PayrollTaxDiversionScheme::new(scheme_id, &perpetrator)),
+                SchemeType::InventoryManipulation => Box::new(InventoryManipulationScheme::new(scheme_id, &perpetrator)),
+                SchemeType::RelatedPartyAbuse => {
+                    // Related-party scheme needs a vendor. Reuse the same vendor
+                    // selection logic as kickback (prefer V- prefix, not already active).
+                    let available_vendors: Vec<_> = context
+                        .available_counterparties
+                        .iter()
+                        .filter(|v| v.starts_with("V-") && !self.active_vendors.contains(v))
+                        .cloned()
+                        .collect();
+                    if available_vendors.is_empty() {
+                        continue;
+                    }
+                    let vendor_idx = self.rng.random_range(0..available_vendors.len());
+                    let vendor = available_vendors[vendor_idx].clone();
+                    self.active_vendors.push(vendor.clone());
+                    Box::new(RelatedPartyScheme::new(scheme_id, &perpetrator, &vendor))
+                }
+                SchemeType::CircularCashFlow => Box::new(CircularCashFlowScheme::new(scheme_id, &perpetrator)),
                 // Disabled: Circular Funding, Phantom Warehousing, Intercompany Wash Trades. Smurfing removed.
                 SchemeType::CircularFunding
                 | SchemeType::PhantomWarehousing
                 | SchemeType::IntercompanyWashTrades => continue,
-                // These are currently not wired in the config-driven advancer list.
                 _ => continue,
             };
 
             self.scheme_rngs
                 .entry(scheme_id)
                 .or_insert_with(|| seeded_rng(self.config.seed, scheme_id.as_u128() as u64));
-            self.active_perpetrators.push(perpetrator);
+            self.active_perpetrators.push(perpetrator.clone());
             self.active_schemes.push(scheme);
-            started.push(scheme_id);
+            started.push((scheme_id, scheme_type, perpetrator.clone()));
         }
 
-        started
+        // Co-occurrence pass: for each newly started scheme, draw co-occurring schemes.
+        let mut co_starts: Vec<(SchemeType, String)> = Vec::new();
+        for (_, from_type, perp) in &started {
+            for (&(from, to), &prob) in &self.config.co_occurrence {
+                if from == *from_type && prob > 0.0 && self.rng.random::<f64>() < prob {
+                    let active_of_type = self.active_schemes.iter()
+                        .filter(|s| s.scheme_type() == to)
+                        .count();
+                    if active_of_type < self.config.max_concurrent_schemes {
+                        co_starts.push((to, perp.clone()));
+                    }
+                }
+            }
+        }
+        for (co_type, perp) in co_starts {
+            let co_id = self.scheme_uuid_factory.next();
+            let co_scheme: Option<Box<dyn FraudScheme>> = match co_type {
+                SchemeType::GradualEmbezzlement => Some(Box::new(
+                    GradualEmbezzlementScheme::new(co_id, &perp)
+                        .with_accounts(context.available_accounts.clone()),
+                )),
+                SchemeType::ExpenseLaundering => Some(Box::new(ExpenseLaunderingScheme::new(co_id, &perp))),
+                SchemeType::ShadowPayroll => Some(Box::new(ShadowPayrollScheme::new(co_id, &perp))),
+                SchemeType::TriadBypass => Some(Box::new(TriadBypassScheme::new(co_id, &perp))),
+                SchemeType::PayrollTaxDiversion => Some(Box::new(PayrollTaxDiversionScheme::new(co_id, &perp))),
+                SchemeType::InventoryManipulation => Some(Box::new(InventoryManipulationScheme::new(co_id, &perp))),
+                SchemeType::CircularCashFlow => Some(Box::new(CircularCashFlowScheme::new(co_id, &perp))),
+                _ => None,
+            };
+            if let Some(s) = co_scheme {
+                self.scheme_rngs.entry(co_id)
+                    .or_insert_with(|| seeded_rng(self.config.seed, co_id.as_u128() as u64));
+                if !self.active_perpetrators.contains(&perp) {
+                    self.active_perpetrators.push(perp);
+                }
+                self.active_schemes.push(s);
+                started.push((co_id, co_type, String::new()));
+            }
+        }
+
+        started.into_iter().map(|(id, _, _)| id).collect()
     }
 
     /// Backwards-compatible wrapper: starts independent schemes and returns the first started id.
@@ -485,6 +614,14 @@ impl SchemeAdvancer {
             .iter()
             .find(|s| s.scheme_id() == scheme_id)
             .map(|s| s.as_ref())
+    }
+
+    /// Returns all ghost employee records from active and completed shadow payroll schemes.
+    pub fn ghost_employees(&self) -> Vec<GhostEmployeeRecord> {
+        self.active_schemes
+            .iter()
+            .flat_map(|s| s.ghost_employees())
+            .collect()
     }
 
     /// Resets the advancer state.

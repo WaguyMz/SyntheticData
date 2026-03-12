@@ -1,19 +1,20 @@
 //! Expense laundering (entropy fan-out) fraud scheme.
 //!
-//! A network of newly-created shell vendors receives micro-expenses routed through a
-//! suspense account (471000) to obscure the cash flow.
+//! Fictitious micro-expenses are submitted under **existing vendor identities** so the
+//! resulting journal entries are indistinguishable from legitimate P2P activity.
 //!
-//! v2.0 changes:
-//! - Shell vendor IDs are generated as `SHL-{scheme_id[:6]}-{n}` — NOT reused from
-//!   `available_counterparties`.
-//! - Stage 0: emits one `CreateShellVendor` admin action per shell vendor.
-//! - Stage 1: every micro-invoice emits a **two-step suspense wash**:
-//!     Step 1 → `SuspenseStaging`  (Dr Expense + VAT, Cr 471000)
-//!     Step 2 → `SuspenseClearance` (Dr 471000, Cr AP)
-//!   Shell vendors are rotated at the midpoint.
+//! v3.0 changes (anti-leak hardening):
+//! - Vendors are sampled from `context.available_counterparties` (real master data) —
+//!   no more `SHL-` prefixed shell vendor IDs.
+//! - Invoice references use the same `VI:INV-{hash}-{n}` format as the P2P generator.
+//! - Stage 0 is a silent setup phase (no JE emitted): it picks target vendors.
+//! - Stage 1: every micro-invoice emits a **two-step wash**:
+//!     Step 1 → `SuspenseStaging`  (Dr Expense + VAT, Cr AP)
+//!     Step 2 → `SuspenseClearance` (Dr AP, Cr Bank)
+//!   Vendors are rotated at the midpoint.
 //!   Amount scaling: base_max = max(50.0, annual_revenue / 100_000.0);
 //!                   amount ∈ [base_max × 0.01, base_max × 0.10]
-//! - Stage 2: one `ShellVendorSettlement` per shell vendor + single `ConsolidationWire`.
+//! - Stage 2: one `ShellVendorSettlement` per vendor + single `ConsolidationWire`.
 
 use chrono::{Duration, NaiveDate};
 use rand::Rng;
@@ -46,11 +47,11 @@ pub struct ExpenseLaunderingScheme {
     detection_probability: f64,
     stage_transaction_count: u32,
     days_since_last_transaction: u32,
-    /// Generated shell vendor IDs (SHL-{prefix}-{n}).
-    shell_vendors: Vec<String>,
-    /// Whether CreateShellVendor actions have been emitted.
-    vendors_created: bool,
-    /// Index into shell_vendors for current rotation.
+    /// Target vendor IDs sampled from existing master data.
+    target_vendors: Vec<String>,
+    /// Whether target vendors have been selected from available counterparties.
+    vendors_selected: bool,
+    /// Index into target_vendors for current rotation.
     current_vendor_index: usize,
     /// Whether Stage 2 settlement has been emitted.
     settlement_emitted: bool,
@@ -94,14 +95,6 @@ impl ExpenseLaunderingScheme {
             .with_technique(ConcealmentTechnique::DataAlteration),
         ];
 
-        // Pre-generate shell vendor IDs: SHL-{first 6 chars of scheme_id}-{0..N}
-        let id_str = scheme_id.to_string().replace('-', "");
-        let prefix = &id_str[..id_str.len().min(6)];
-        let n_vendors = 4usize; // default; could be made configurable
-        let shell_vendors = (0..n_vendors)
-            .map(|i| format!("SHL-{}-{}", prefix, i))
-            .collect();
-
         Self {
             scheme_id,
             perpetrator_id: perpetrator_id.into(),
@@ -115,8 +108,8 @@ impl ExpenseLaunderingScheme {
             detection_probability: 0.0,
             stage_transaction_count: 0,
             days_since_last_transaction: 0,
-            shell_vendors,
-            vendors_created: false,
+            target_vendors: Vec::new(),
+            vendors_selected: false,
             current_vendor_index: 0,
             settlement_emitted: false,
         }
@@ -236,36 +229,30 @@ impl FraudScheme for ExpenseLaunderingScheme {
         let stage = self.stages[self.current_stage_index].clone();
 
         match self.current_stage_index {
-            // Stage 0: emit CreateShellVendor for each shell vendor (once)
+            // Stage 0: silently select target vendors from existing master data.
+            // No JE is emitted — this avoids leaking identifiable shell vendor IDs.
             0 => {
-                if !self.vendors_created {
-                    for (idx, vendor_id) in self.shell_vendors.clone().iter().enumerate() {
-                        let action_date =
-                            context.current_date + Duration::days(idx as i64);
-                        let action = SchemeAction::new(
-                            self.scheme_id,
-                            stage.stage_number,
-                            SchemeActionType::CreateShellVendor,
-                            action_date,
-                        )
-                        .with_scheme_type(self.scheme_type())
-                        .with_counterparty(vendor_id)
-                        .with_user(&self.perpetrator_id)
-                        .with_difficulty(stage.detection_difficulty)
-                        .with_description(format!(
-                            "Shell vendor created: {} (not in approved vendor master)",
-                            vendor_id
-                        ))
-                        .with_technique(ConcealmentTechnique::FalseDocumentation);
-                        actions.push(action);
+                if !self.vendors_selected {
+                    let n_vendors = 4usize;
+                    if context.available_counterparties.len() >= n_vendors {
+                        // Deterministic shuffle seeded from scheme_id so picks are reproducible.
+                        let mut candidates = context.available_counterparties.clone();
+                        let seed = self.scheme_id.as_u128() as u64;
+                        let mut pick_rng = <rand_chacha::ChaCha8Rng as rand::SeedableRng>::seed_from_u64(seed);
+                        use rand::seq::SliceRandom;
+                        candidates.shuffle(&mut pick_rng);
+                        self.target_vendors = candidates.into_iter().take(n_vendors).collect();
+                    } else {
+                        // Fallback: use whatever counterparties are available.
+                        self.target_vendors = context.available_counterparties.clone();
                     }
-                    self.vendors_created = true;
+                    self.vendors_selected = true;
                     self.stage_transaction_count += 1;
                     self.detection_probability = (self.detection_probability + 0.005).min(0.9);
                 }
             }
 
-            // Stage 1: two-step suspense wash per micro-invoice
+            // Stage 1: two-step wash per micro-invoice using existing vendors
             1 => {
                 let target_count = stage.random_transaction_count(rng);
                 let should_transact = self.stage_transaction_count < target_count
@@ -277,26 +264,29 @@ impl FraudScheme for ExpenseLaunderingScheme {
 
                     // Rotate vendor at midpoint of stage
                     if self.stage_transaction_count == target_count / 2
-                        && !self.shell_vendors.is_empty()
+                        && !self.target_vendors.is_empty()
                     {
                         self.current_vendor_index =
-                            (self.current_vendor_index + 1) % self.shell_vendors.len();
+                            (self.current_vendor_index + 1) % self.target_vendors.len();
                     }
 
-                    let vendor = if self.shell_vendors.is_empty() {
-                        "SHL-FALLBACK".to_string()
+                    let vendor = if self.target_vendors.is_empty() {
+                        context.available_counterparties.first()
+                            .cloned()
+                            .unwrap_or_else(|| "V-000001".to_string())
                     } else {
-                        self.shell_vendors[self.current_vendor_index % self.shell_vendors.len()]
+                        self.target_vendors[self.current_vendor_index % self.target_vendors.len()]
                             .clone()
                     };
 
+                    // Use a normal invoice reference format matching the P2P generator
                     let inv_ref = format!(
-                        "SHL-INV-{:08x}-{}",
+                        "VI:INV-{:08x}-{}",
                         self.scheme_id.as_u128() as u32,
                         self.stage_transaction_count
                     );
 
-                    // Step 1: SuspenseStaging (Dr Expense + VAT, Cr 471000)
+                    // Step 1: Invoice booking (Dr Expense + VAT, Cr AP)
                     let mut stage1_action = SchemeAction::new(
                         self.scheme_id,
                         stage.stage_number,
@@ -310,7 +300,7 @@ impl FraudScheme for ExpenseLaunderingScheme {
                     .with_difficulty(stage.detection_difficulty)
                     .with_reference(&inv_ref)
                     .with_description(format!(
-                        "Suspense staging: Dr Expense+VAT, Cr 471000 — vendor {}",
+                        "Vendor invoice: Dr Expense+VAT, Cr AP — vendor {}",
                         vendor
                     ));
                     for t in &stage.concealment_techniques {
@@ -318,7 +308,7 @@ impl FraudScheme for ExpenseLaunderingScheme {
                     }
                     actions.push(stage1_action);
 
-                    // Step 2: SuspenseClearance (Dr 471000, Cr AP) — 1-2 days later
+                    // Step 2: Payment (Dr AP, Cr Bank) — 1-2 days later
                     let clear_date = context.current_date
                         + chrono::Duration::days(rng.random_range(1i64..=2i64));
                     let mut stage2_action = SchemeAction::new(
@@ -334,7 +324,7 @@ impl FraudScheme for ExpenseLaunderingScheme {
                     .with_difficulty(stage.detection_difficulty)
                     .with_reference(&inv_ref)
                     .with_description(format!(
-                        "Suspense clearance: Dr 471000, Cr AP — vendor {}",
+                        "Vendor payment: Dr AP, Cr Bank — vendor {}",
                         vendor
                     ));
                     for t in &stage.concealment_techniques {
@@ -350,11 +340,10 @@ impl FraudScheme for ExpenseLaunderingScheme {
                 }
             }
 
-            // Stage 2: ShellVendorSettlement per vendor + ConsolidationWire
+            // Stage 2: Settlement per vendor + ConsolidationWire
             2 => {
                 if !self.settlement_emitted {
-                    for (idx, vendor_id) in self.shell_vendors.clone().iter().enumerate() {
-                        // Use fingerprint distribution so settlement amounts are in-distribution (not easy outliers)
+                    for (idx, vendor_id) in self.target_vendors.clone().iter().enumerate() {
                         let settle_amount = context
                             .sample_amount_from_fingerprint(rng, Some("6XXX"))
                             .unwrap_or_else(|| stage.random_amount(rng));
@@ -372,14 +361,14 @@ impl FraudScheme for ExpenseLaunderingScheme {
                         .with_user(&self.perpetrator_id)
                         .with_difficulty(stage.detection_difficulty)
                         .with_description(format!(
-                            "Settle AP outstanding to shell vendor {} (Dr AP, Cr Bank)",
+                            "Settle AP outstanding to vendor {} (Dr AP, Cr Bank)",
                             vendor_id
                         ))
                         .with_technique(ConcealmentTechnique::TimingExploitation);
                         actions.push(action);
                     }
 
-                    // Single ConsolidationWire aggregating all shell proceeds
+                    // Single ConsolidationWire aggregating proceeds
                     let wire_candidate = context
                         // Use fingerprint distribution so wire amounts are in-distribution (not easy outliers)
                         .sample_amount_from_fingerprint(rng, Some("6XXX"))
@@ -396,7 +385,7 @@ impl FraudScheme for ExpenseLaunderingScheme {
                     .with_user(&self.perpetrator_id)
                     .with_difficulty(stage.detection_difficulty)
                     .with_description(
-                        "Consolidation wire: aggregate shell proceeds to offshore (Dr 581000, Cr Bank)"
+                        "Consolidation wire: aggregate proceeds (Dr 581000, Cr Bank)"
                             .to_string(),
                     )
                     .with_technique(ConcealmentTechnique::DataAlteration);
@@ -462,49 +451,56 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     #[test]
-    fn test_shell_vendor_id_format() {
-        let scheme = ExpenseLaunderingScheme::new(Uuid::nil(), "EMP001");
-        for v in &scheme.shell_vendors {
-            assert!(v.starts_with("SHL-"), "expected SHL- prefix, got {}", v);
-        }
-        assert!(!scheme.shell_vendors.is_empty());
-    }
-
-    #[test]
-    fn test_shell_vendors_not_from_counterparties() {
+    fn test_vendors_selected_from_counterparties() {
         let mut scheme = ExpenseLaunderingScheme::new(Uuid::nil(), "EMP001");
         let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let vendors: Vec<String> = (0..10).map(|i| format!("V-{:06}", i)).collect();
         let context = SchemeContext::new(
             NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
             "1000",
         )
-        .with_counterparties(vec!["EXISTING-VENDOR".to_string()]);
+        .with_counterparties(vendors.clone());
         let _ = scheme.advance(&context, &mut rng);
-        // Shell vendors must NOT contain the pre-existing vendor
-        assert!(!scheme.shell_vendors.contains(&"EXISTING-VENDOR".to_string()));
+        assert!(!scheme.target_vendors.is_empty());
+        for v in &scheme.target_vendors {
+            assert!(
+                vendors.contains(v),
+                "target vendor {} should come from available counterparties",
+                v
+            );
+            assert!(
+                !v.starts_with("SHL-"),
+                "vendor {} must not have SHL- prefix",
+                v
+            );
+        }
     }
 
     #[test]
-    fn test_stage0_emits_create_shell_vendor() {
+    fn test_stage0_emits_no_actions() {
         let mut scheme = ExpenseLaunderingScheme::new(Uuid::nil(), "EMP001");
         let mut rng = ChaCha8Rng::seed_from_u64(5);
-        let context =
-            SchemeContext::new(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(), "1000");
+        let vendors: Vec<String> = (0..10).map(|i| format!("V-{:06}", i)).collect();
+        let context = SchemeContext::new(
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+            "1000",
+        )
+        .with_counterparties(vendors);
         let actions = scheme.advance(&context, &mut rng);
-        let vendor_creates = actions
-            .iter()
-            .filter(|a| a.action_type == SchemeActionType::CreateShellVendor)
-            .count();
-        assert_eq!(vendor_creates, scheme.shell_vendors.len());
+        assert!(
+            actions.is_empty(),
+            "Stage 0 should not emit any journal-entry-producing actions"
+        );
     }
 
     #[test]
     fn test_stage1_two_step_wash() {
         let mut scheme = ExpenseLaunderingScheme::new(Uuid::nil(), "EMP001");
-        // Manually advance to stage 1
         scheme.current_stage_index = 1;
         scheme.start_date = Some(NaiveDate::from_ymd_opt(2024, 3, 1).unwrap());
         scheme.status = SchemeStatus::Active;
+        scheme.target_vendors = vec!["V-000001".to_string(), "V-000002".to_string()];
+        scheme.vendors_selected = true;
         let mut rng = ChaCha8Rng::seed_from_u64(99);
         let context =
             SchemeContext::new(NaiveDate::from_ymd_opt(2024, 3, 5).unwrap(), "1000");
@@ -515,6 +511,10 @@ mod tests {
             for a in &actions {
                 if a.action_type == SchemeActionType::SuspenseStaging {
                     found_staging = true;
+                    assert!(
+                        !a.counterparty.as_ref().unwrap().starts_with("SHL-"),
+                        "counterparty should not have SHL- prefix"
+                    );
                 }
                 if a.action_type == SchemeActionType::SuspenseClearance {
                     found_clearance = true;
@@ -525,6 +525,36 @@ mod tests {
             found_staging && found_clearance,
             "Both SuspenseStaging and SuspenseClearance must be emitted"
         );
+    }
+
+    #[test]
+    fn test_reference_format_no_shl_prefix() {
+        let mut scheme = ExpenseLaunderingScheme::new(Uuid::nil(), "EMP001");
+        scheme.current_stage_index = 1;
+        scheme.start_date = Some(NaiveDate::from_ymd_opt(2024, 3, 1).unwrap());
+        scheme.status = SchemeStatus::Active;
+        scheme.target_vendors = vec!["V-000001".to_string()];
+        scheme.vendors_selected = true;
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let context =
+            SchemeContext::new(NaiveDate::from_ymd_opt(2024, 3, 5).unwrap(), "1000");
+        for _ in 0..50 {
+            let actions = scheme.advance(&context, &mut rng);
+            for a in &actions {
+                if let Some(ref r) = a.reference {
+                    assert!(
+                        r.starts_with("VI:INV-"),
+                        "reference should use VI:INV- format, got {}",
+                        r
+                    );
+                    assert!(
+                        !r.contains("SHL"),
+                        "reference must not contain SHL, got {}",
+                        r
+                    );
+                }
+            }
+        }
     }
 
     #[test]

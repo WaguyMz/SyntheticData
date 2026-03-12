@@ -8119,6 +8119,30 @@ pub struct MultiStageSchemeConfig {
     #[serde(default)]
     pub intercompany_wash_trade: SchemeProbabilityOnlyConfig,
 
+    /// Payroll tax diversion (negative-signal fraud) scheme probability.
+    #[serde(default)]
+    pub payroll_tax_diversion: SchemeProbabilityOnlyConfig,
+
+    /// Inventory manipulation (balance-sheet fraud) scheme probability.
+    #[serde(default)]
+    pub inventory_manipulation: SchemeProbabilityOnlyConfig,
+
+    /// Related-party transaction abuse (cross-domain) scheme probability.
+    #[serde(default)]
+    pub related_party_abuse: SchemeProbabilityOnlyConfig,
+
+    /// Circular cash flow (temporal chain) scheme probability.
+    #[serde(default)]
+    pub circular_cash_flow: SchemeProbabilityOnlyConfig,
+
+    /// Probability of reusing an active perpetrator for a new scheme.
+    #[serde(default)]
+    pub perpetrator_reuse_probability: f64,
+
+    /// Max schemes per perpetrator when reuse is active.
+    #[serde(default = "default_max_schemes_per_perpetrator")]
+    pub max_schemes_per_perpetrator: usize,
+
     /// Number of journal entries per (company, month) that grant one scheme start attempt.
     /// Higher value = fewer attempts per month for the same volume. Default 5000.
     #[serde(default = "default_entries_per_start_attempt")]
@@ -8151,6 +8175,10 @@ fn default_max_concurrent_schemes() -> usize {
 
 fn default_allow_repeat_perpetrators() -> bool {
     false
+}
+
+fn default_max_schemes_per_perpetrator() -> usize {
+    3
 }
 
 /// Config for scheme types that only expose a probability (no stage/amount tuning).

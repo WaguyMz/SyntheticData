@@ -89,13 +89,22 @@ impl ConfigSynthesizer {
             }
         }
 
-        // Map anomaly rates if present and enabled
+        // Map anomaly rates if present and enabled. If the fingerprint does not carry anomaly
+        // metadata (or the empirical rate is zero), fall back to a conservative default so that
+        // fingerprint-based generation can still inject anomalies.
         if self.options.inject_anomalies {
-            if let Some(ref anomalies) = fingerprint.anomalies {
-                let rate = anomalies.overall.anomaly_rate;
-                patch.set("anomaly_injection.overall_rate", ConfigValue::Float(rate));
-                patch.set("anomaly_injection.enabled", ConfigValue::Bool(rate > 0.0));
-            }
+            let default_rate = 0.02;
+            let rate = fingerprint
+                .anomalies
+                .as_ref()
+                .map(|a| a.overall.anomaly_rate)
+                .filter(|r| *r > 0.0)
+                .unwrap_or(default_rate);
+
+            patch.set("anomaly_injection.overall_rate", ConfigValue::Float(rate));
+            // Always enable anomaly injection when requested in options; the actual on/off
+            // behaviour is controlled via the rate (which may be the default above).
+            patch.set("anomaly_injection.enabled", ConfigValue::Bool(true));
         }
 
         Ok(patch)

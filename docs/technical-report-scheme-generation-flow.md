@@ -1,8 +1,8 @@
 # Technical Report: Generation Flow of Multi-Stage Fraud Schemes
 
-**Document version:** 2.0
-**Date:** 2026-03-04
-**Status:** Revised Implementation Spec – 6 Core Schemes
+**Document version:** 3.0
+**Date:** 2026-03-12
+**Status:** Revised Implementation Spec – 10 Core Schemes
 **Scope:** datasynth-generators (anomaly/schemes), datasynth-runtime (anomaly injection phase), datasynth-config (multi_stage_schemes schema).
 
 ---
@@ -11,9 +11,17 @@
 
 The DataSynth pipeline generates **multi-stage fraud scheme** labels by driving a **SchemeAdvancer** from the runtime: once per simulated month it may start new schemes (by type and probability), and once per calendar day per company it advances all active schemes. Each advancement yields **SchemeAction**s, which are turned into **MultiStageAnomalyLabel**s and then into exported **LabeledAnomaly** records.
 
-This document is the **normative implementation spec** for the **6 fraud schemes** retained after v1.5 scope reduction. It supersedes the descriptive sections of v1.5 with **precise behavioural requirements** derived from the gap analysis in the former Section 12. Each scheme section states what the implementation **must** do, including required JE patterns, account constraints, label semantics, and stage behaviour.
+This document is the **normative implementation spec** for the **10 fraud schemes** in the current scope. It supersedes v2.0 (6 schemes) with 4 new typologies added in v3.0, along with structural improvements (perpetrator reuse, co-occurrence, lettrage, split payments, after-hours timestamps, ghost employee master data, concealment patterns).
 
-Removed in v2.0 scope: CircularFunding, PhantomWarehousing, IntercompanyWashTrades (all required multi-entity topology not available in the single-FEC scope).
+Removed from scope: CircularFunding, PhantomWarehousing, IntercompanyWashTrades (all require multi-entity topology not available in single-FEC scope).
+
+### v3.0 Additions (2026-03-12)
+- **4 new schemes:** Payroll Tax Diversion, Inventory Manipulation, Related-Party Transaction Abuse, Circular Cash Flow.
+- **Embezzlement:** Now emits paired Invoice (`EmbezzleInvoice`) + Payment (`EmbezzlePayment`) with lettrage matching on AP lines. After-hours timestamps (22:00–06:00) on Stage 0/1.
+- **Kickback:** Split payments (2–3 partial `PayInflatedInvoicePartial` at T+10, T+15, T+20).
+- **Shadow Payroll:** Ghost employee master data record via `ghost_employees()` trait method.
+- **All schemes:** `user_id` → `created_by` propagation, `target_time` → `created_at` in materialiser.
+- **SchemeAdvancer:** Perpetrator reuse probability, co-occurrence matrix, new scheme type draws.
 
 ---
 
@@ -51,10 +59,12 @@ Removed in v2.0 scope: CircularFunding, PhantomWarehousing, IntercompanyWashTrad
                                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  SchemeAdvancer                                                               │
-│  • maybe_start_scheme(context): independent Bernoulli draw per scheme type;  │
-│    instantiates the scheme struct; assigns perpetrator + vendor (kickback)    │
+│  • maybe_start_schemes(context): independent Bernoulli draw per scheme type; │
+│    instantiates scheme struct; assigns perpetrator (with reuse logic) +       │
+│    vendor; co-occurrence pass starts linked schemes with same perpetrator     │
 │  • advance_all(context): calls scheme.advance(ctx, rng) per active scheme    │
 │  • record_label(anomaly_id, action): pushes MultiStageAnomalyLabel           │
+│  • ghost_employees(): collects GhostEmployeeRecord from active schemes       │
 │  • flush_completed_schemes(context): removes Completed/Terminated/Detected   │
 └───────────────────────────────────────┬─────────────────────────────────────┘
                                         │
@@ -84,10 +94,16 @@ Under `anomaly_injection.multi_stage_schemes`:
 | `triad_bypass` | SchemeProbabilityOnlyConfig | Single `probability`. |
 | `shadow_payroll` | SchemeProbabilityOnlyConfig | Single `probability`. |
 | `expense_laundering` | SchemeProbabilityOnlyConfig | Single `probability`. |
+| `payroll_tax_diversion` | SchemeProbabilityOnlyConfig | Single `probability`. |
+| `inventory_manipulation` | SchemeProbabilityOnlyConfig | Single `probability`. |
+| `related_party_abuse` | SchemeProbabilityOnlyConfig | Single `probability`. |
+| `circular_cash_flow` | SchemeProbabilityOnlyConfig | Single `probability`. |
 | `entries_per_start_attempt` | u64 | Volume gating (default 5000). |
 | `max_starts_per_company_per_month` | u32 | Hard cap per company-month (default 10). |
 | `max_concurrent_schemes` | usize | Per-type concurrency cap (default 5). |
 | `allow_repeat_perpetrators` | bool | Default false. |
+| `perpetrator_reuse_probability` | f64 | P(new scheme assigned to existing perpetrator). Default 0. |
+| `max_schemes_per_perpetrator` | usize | Cap on schemes per perpetrator. Default 3. |
 
 Example:
 
@@ -95,29 +111,40 @@ Example:
 anomaly_injection:
   multi_stage_schemes:
     enabled: true
-    embezzlement:       { probability: 0.03 }
-    revenue_manipulation: { probability: 0.02 }
-    kickback:           { probability: 0.015, amount_shift_percent: 0.15,
-                          vendor_typical_amount_min: 5000, vendor_typical_amount_max: 50000 }
-    triad_bypass:       { probability: 0.008 }
-    shadow_payroll:     { probability: 0.008 }
-    expense_laundering: { probability: 0.015 }
+    embezzlement:             { probability: 0.03 }
+    revenue_manipulation:     { probability: 0.02 }
+    kickback:                 { probability: 0.015, amount_shift_percent: 0.15,
+                                vendor_typical_amount_min: 5000, vendor_typical_amount_max: 50000 }
+    triad_bypass:             { probability: 0.008 }
+    shadow_payroll:           { probability: 0.008 }
+    expense_laundering:       { probability: 0.015 }
+    payroll_tax_diversion:    { probability: 0.008 }
+    inventory_manipulation:   { probability: 0.005 }
+    related_party_abuse:      { probability: 0.005 }
+    circular_cash_flow:       { probability: 0.005 }
     entries_per_start_attempt: 10000
     max_starts_per_company_per_month: 2
+    allow_repeat_perpetrators: true
+    perpetrator_reuse_probability: 0.30
+    max_schemes_per_perpetrator: 3
 ```
 
 ### 3.2 Recommended probabilities
 
 For a single-company FEC with ~10k JEs/year:
 
-| Scheme | Probability | Notes |
-|--------|-------------|-------|
-| Embezzlement | 0.03 | Most common; long lifecycle |
-| Revenue manipulation | 0.02 | Quarterly-bounded |
-| Kickback | 0.015 | Requires available vendor |
-| Expense laundering | 0.015 | Fan-out; needs multiple counterparties |
-| Triad bypass | 0.008 | Short scheme, high severity |
-| Shadow payroll | 0.008 | Long cycle; needs employee-naming conventions |
+| Scheme | Probability | Category | Notes |
+|--------|-------------|----------|-------|
+| Embezzlement | 0.03 | Sequential | Most common; long lifecycle |
+| Revenue manipulation | 0.02 | Volume | Quarterly-bounded |
+| Kickback | 0.015 | Relational | Requires available vendor |
+| Expense laundering | 0.015 | Volume | Fan-out; needs multiple counterparties |
+| Triad bypass | 0.008 | Relational | Short scheme, high severity |
+| Shadow payroll | 0.008 | Sequential | Long cycle; needs employee-naming conventions |
+| Payroll tax diversion | 0.008 | Negative-Signal | Negative-signal fraud (absence of remittances) |
+| Inventory manipulation | 0.005 | Balance-Sheet | Balance-sheet fraud via fictitious GRs + write-off |
+| Related-party abuse | 0.005 | Cross-Domain | Requires master data + entity graph correlation |
+| Circular cash flow | 0.005 | Temporal-Chain | 3-step temporal chain (fake receipt → AR clear → bad debt) |
 
 Probabilities are **independent** Bernoulli draws — they do not need to sum to 1.
 
@@ -304,7 +331,7 @@ Uses a DIFFERENT shell vendor.
 * **Objective:** Add a fake employee; collect monthly salary.
 
 ### 6.1 Lifecycle
-* **Action: `GhostHire` (Admin):** No JE.
+* **Action: `GhostHire` (Admin):** No JE. Creates a `GhostEmployeeRecord` in master data via `ghost_employees()` trait method (v3.0).
 * **Action: `MonthlyPayroll` (Financial):** Recurring every month-end.
 * **Action: `GhostTermination` (Admin/Financial).**
 
@@ -315,6 +342,9 @@ Uses a DIFFERENT shell vendor.
 | 1 | `641100` (Wages) | Dr | Salary |
 | 2 | `645100` (Charges) | Dr | Salary * 0.42 |
 | 3 | `421000` (Personnel) | Cr | Salary * 1.42 |
+
+### 6.3 Master Data Mutation (v3.0)
+When `GhostHire` fires, the scheme returns a `GhostEmployeeRecord { employee_id, display_name, hire_date, perpetrator_id, scheme_id }`. The `SchemeAdvancer.ghost_employees()` method collects these for downstream master data injection.
 
 ---
 
@@ -340,6 +370,165 @@ Uses a DIFFERENT shell vendor.
 | :--- | :--- | :--- | :--- |
 | 1 | `471000` (Suspense) | Dr | Amount |
 | 2 | `401000` (Vendor AP) | Cr | Amount |
+
+---
+
+## 8. Scheme 7: Payroll Tax Diversion (v3.0)
+
+* **Process Category:** HR / Payroll → Treasury.
+* **Objective:** Perpetrator diverts payroll tax remittances; the fraud signal is the **absence** of expected outflows (negative-signal fraud).
+* **Detection Challenge:** Requires the agent to reason about what *should* have happened but did not.
+
+### 8.1 Lifecycle & Stages
+
+* **Stage 0 (Baseline, 2 months):** Normal payroll processing — taxes withheld and remitted on schedule. Establishes the "expected" pattern.
+* **Stage 1 (Diversion, 3 months):** Tax remittance JEs are **suppressed** (action `SuppressRemittance` — no JE emitted). The withheld amount remains in liability account `431000`.
+* **Stage 2 (Cover-up, 2 months):** Fictitious remittance via suspense account to conceal the growing liability (`ConcealRemittance`: Dr `431000`, Cr `471000`).
+
+### 8.2 Precise JE Patterns
+
+**`SuppressRemittance` (Stage 1):** No JE produced — this is the signal. The expected monthly remittance (Dr `431000` Social Security Payable, Cr `512000` Bank) is absent.
+
+**`ConcealRemittance` (Stage 2):**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `431000` | Social Security Payable | Dr | Amount |
+| 2 | `471000` | Suspense | Cr | Amount |
+
+### 8.3 Forensic Markers
+* Growing balance on `431000` with no matching bank outflow.
+* Concealment JEs to suspense have perpetrator's `user_id` and no external reference.
+
+---
+
+## 9. Scheme 8: Inventory Manipulation (v3.0)
+
+* **Process Category:** Supply Chain / Balance Sheet.
+* **Objective:** Inflate inventory value via fictitious goods receipts, siphon physical inventory, then write off as shrinkage.
+* **Detection Challenge:** Balance-sheet fraud; requires reasoning about inventory flow consistency.
+
+### 9.1 Lifecycle & Stages
+
+* **Stage 0 (Inflation, 3 months):** Fictitious goods receipt notes (`FictitiousGoodsReceipt`) increase inventory without corresponding POs.
+* **Stage 1 (Siphoning, 2 months):** Physical theft — no JE emitted. Inventory physically leaves but the books still show it.
+* **Stage 2 (Write-off, 1 month):** `InventoryWriteOff` as spoilage/shrinkage to reconcile books with physical count.
+
+### 9.2 Precise JE Patterns
+
+**`FictitiousGoodsReceipt` (Stage 0):**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `370000` | Inventory | Dr | Amount |
+| 2 | `603000` | COGS Reversal / Purchases | Cr | Amount |
+
+**`InventoryWriteOff` (Stage 2):**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `685000` | Exceptional Charges (Shrinkage) | Dr | Amount |
+| 2 | `370000` | Inventory | Cr | Amount |
+
+### 9.3 Forensic Markers
+* Goods receipts without matching PO references.
+* Large write-off amounts at fiscal year-end clustered under a single perpetrator.
+* Inventory account balance inflation followed by sudden reduction.
+
+---
+
+## 10. Scheme 9: Related-Party Transaction Abuse (v3.0)
+
+* **Process Category:** P2P — Cross-Domain / Entity Network.
+* **Objective:** Register a fictitious vendor controlled by the perpetrator and route procurement through it at inflated prices.
+* **Detection Challenge:** Requires cross-referencing JE metadata with vendor master data (shared bank accounts, addresses) and entity relationship graphs.
+
+### 10.1 Lifecycle & Stages
+
+* **Stage 0 (Setup, 1 month):** Register a fictitious vendor (`CreateFictitiousVendor`). The vendor shares bank account or address details with the perpetrator or another existing vendor.
+* **Stage 1 (Operation, 4 months):** Normal-looking procurement JEs routed to the related vendor (`RelatedPartyProcurement`). Amounts start conservative.
+* **Stage 2 (Escalation, 2 months):** Volume and amounts increase. Multiple JEs per advance.
+
+### 10.2 Precise JE Pattern
+
+**`RelatedPartyProcurement` (Stages 1–2):**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `622600` | Consulting / Service Fees | Dr | Amount |
+| 2 | `401000` | Vendor AP (Aux: `REL_VND_{scheme_id}`) | Cr | Amount |
+
+### 10.3 Forensic Markers
+* Vendor created shortly before first transaction.
+* Shared bank account between vendor and employee (or another vendor).
+* Concentration of spend with a single new vendor.
+* Perpetrator is both the approver and the vendor contact.
+
+---
+
+## 11. Scheme 10: Circular Cash Flow (v3.0)
+
+* **Process Category:** Treasury / AR — Temporal Chain.
+* **Objective:** Create the illusion of cash collections by cycling funds through suspense accounts. A 3-step temporal chain of interdependent JEs.
+* **Detection Challenge:** The agent must reconstruct the temporal chain across 3 separate JEs that, individually, may appear routine.
+
+### 11.1 Lifecycle
+
+Multi-cycle scheme. Each cycle produces 3 JEs at staggered dates:
+1. **`FakeCashReceipt`** (T+0): Dr Bank, Cr Suspense.
+2. **`ClearARViaSuspense`** (T+5): Dr Suspense, Cr AR.
+3. **`ConcealAsBadDebt`** (T+10): Dr Bad Debt Expense, Cr Bank.
+
+Cycles repeat every ~30 days with escalating amounts.
+
+### 11.2 Precise JE Patterns
+
+**`FakeCashReceipt`:**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `512000` | Bank | Dr | Amount |
+| 2 | `471000` | Suspense | Cr | Amount |
+
+**`ClearARViaSuspense`:**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `471000` | Suspense | Dr | Amount |
+| 2 | `411000` | Accounts Receivable | Cr | Amount |
+
+**`ConcealAsBadDebt`:**
+
+| Line | Account | Description | Side | Amount |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `654000` | Bad Debt Expense | Dr | Amount |
+| 2 | `512000` | Bank | Cr | Amount |
+
+### 11.3 Forensic Markers
+* Suspense account acts as a bridge between otherwise unrelated bank and AR movements.
+* The 3 JEs share the same `user_id` and approximately equal amounts.
+* Bad debt write-offs consistently match recent "cash receipts."
+* Temporal pattern: receipt → clearance → write-off at regular intervals.
+
+---
+
+## 12. Cross-Scheme Structural Features (v3.0)
+
+### 12.1 Perpetrator Reuse
+When `allow_repeat_perpetrators: true` and `perpetrator_reuse_probability > 0`, a newly started scheme may be assigned to an existing perpetrator rather than picking a fresh employee. This models the real-world pattern where a single fraudster operates multiple schemes. Controlled by `max_schemes_per_perpetrator`.
+
+### 12.2 Scheme Co-Occurrence
+The `SchemeAdvancerConfig.co_occurrence` matrix maps `(SchemeType, SchemeType)` pairs to conditional probabilities. When a scheme starts, the advancer checks whether linked schemes should also start with the same perpetrator (e.g., embezzlement often co-occurs with expense laundering).
+
+### 12.3 Concealment Patterns
+All schemes may emit concealment JEs in later stages:
+* **`ConcealReclassify`:** Reclassify suspicious amounts from suspense to an expense account.
+* **`ConcealContraEntry` + `ConcealContraReverse`:** Paired contra-entries that net to zero but obscure the trail.
+
+### 12.4 Business Calendar Awareness
+`SchemeContext` now includes `is_holiday_period` and `days_to_fiscal_year_end`. Schemes can use these to:
+* Accelerate near fiscal year-end (desperation behaviour).
+* Exploit reduced oversight during holiday periods.
 
 ---
 

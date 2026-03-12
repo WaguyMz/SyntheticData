@@ -2112,6 +2112,14 @@ pub enum SchemeType {
     PhantomWarehousing,
     /// Intercompany wash trades (symmetric cancelling trades).
     IntercompanyWashTrades,
+    /// Payroll tax diversion (suppress remittance to tax authority).
+    PayrollTaxDiversion,
+    /// Inventory manipulation (fictitious receipts + write-off).
+    InventoryManipulation,
+    /// Related-party transaction abuse (undisclosed vendor relationship).
+    RelatedPartyAbuse,
+    /// Circular cash flow (fake collection via suspense).
+    CircularCashFlow,
 }
 
 impl SchemeType {
@@ -2133,6 +2141,10 @@ impl SchemeType {
             SchemeType::CircularFunding => "circular_funding",
             SchemeType::PhantomWarehousing => "phantom_warehousing",
             SchemeType::IntercompanyWashTrades => "intercompany_wash_trades",
+            SchemeType::PayrollTaxDiversion => "payroll_tax_diversion",
+            SchemeType::InventoryManipulation => "inventory_manipulation",
+            SchemeType::RelatedPartyAbuse => "related_party_abuse",
+            SchemeType::CircularCashFlow => "circular_cash_flow",
         }
     }
 
@@ -2154,6 +2166,10 @@ impl SchemeType {
             SchemeType::CircularFunding => 3,     // setup loans, execution, reversal
             SchemeType::PhantomWarehousing => 3,   // ghost locations, cycles, concealment
             SchemeType::IntercompanyWashTrades => 3, // setup, wash trades, concealment
+            SchemeType::PayrollTaxDiversion => 3,   // setup, diversion, cover-up
+            SchemeType::InventoryManipulation => 3,  // inflation, siphoning, write-off
+            SchemeType::RelatedPartyAbuse => 3,      // setup, operation, escalation
+            SchemeType::CircularCashFlow => 3,       // fake receipt, AR clearance, concealment
         }
     }
 }

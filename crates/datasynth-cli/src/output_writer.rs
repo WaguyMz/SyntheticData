@@ -501,7 +501,7 @@ fn write_forensic_sql_provisioning(
     )?;
 
     if !result.journal_entries.is_empty() {
-        // Header table
+        // Header table + staging to tolerate duplicate document_ids, then dedupe
         writeln!(
             w,
             "CREATE TABLE IF NOT EXISTS je_header (\n\
@@ -522,14 +522,37 @@ fn write_forensic_sql_provisioning(
              \tledger TEXT,\n\
              \tis_fraud BOOLEAN,\n\
              \tis_anomaly BOOLEAN\n\
-             );\n"
-        )?;
-        writeln!(
-            w,
-            "COPY je_header FROM 'je_header.csv' CSV HEADER;\n"
+             );\n\n\
+             CREATE TEMP TABLE staging_je_header (\n\
+             \tdocument_id UUID,\n\
+             \tcompany_code TEXT,\n\
+             \tfiscal_year INT,\n\
+             \tfiscal_period INT,\n\
+             \tposting_date DATE,\n\
+             \tdocument_date DATE,\n\
+             \tdocument_type TEXT,\n\
+             \tcurrency TEXT,\n\
+             \texchange_rate NUMERIC,\n\
+             \treference TEXT,\n\
+             \theader_text TEXT,\n\
+             \tcreated_by TEXT,\n\
+             \tsource TEXT,\n\
+             \tbusiness_process TEXT,\n\
+             \tledger TEXT,\n\
+             \tis_fraud BOOLEAN,\n\
+             \tis_anomaly BOOLEAN\n\
+             );\n\
+             \\copy staging_je_header FROM 'je_header.csv' CSV HEADER;\n\
+             INSERT INTO je_header\n\
+             SELECT DISTINCT ON (document_id)\n\
+             \tdocument_id, company_code, fiscal_year, fiscal_period, posting_date, document_date,\n\
+             \tdocument_type, currency, exchange_rate, reference, header_text, created_by, source,\n\
+             \tbusiness_process, ledger, is_fraud, is_anomaly\n\
+             FROM staging_je_header\n\
+             ORDER BY document_id;\n"
         )?;
 
-        // Line table
+        // Line table + staging; insert only rows whose document_id exists in je_header
         writeln!(
             w,
             "CREATE TABLE IF NOT EXISTS je_line (\n\
@@ -549,11 +572,32 @@ fn write_forensic_sql_provisioning(
              \tlettrage_date DATE,\n\
              \tis_fraud BOOLEAN,\n\
              \tis_anomaly BOOLEAN\n\
-             );\n"
-        )?;
-        writeln!(
-            w,
-            "COPY je_line FROM 'je_line.csv' CSV HEADER;\n"
+             );\n\n\
+             CREATE TEMP TABLE staging_je_line (\n\
+             \tdocument_id UUID,\n\
+             \tline_number INT,\n\
+             \tcompany_code TEXT,\n\
+             \tgl_account TEXT,\n\
+             \tdebit_amount NUMERIC,\n\
+             \tcredit_amount NUMERIC,\n\
+             \tlocal_amount NUMERIC,\n\
+             \tcost_center TEXT,\n\
+             \tprofit_center TEXT,\n\
+             \tline_text TEXT,\n\
+             \tauxiliary_account_number TEXT,\n\
+             \tauxiliary_account_label TEXT,\n\
+             \tlettrage TEXT,\n\
+             \tlettrage_date DATE,\n\
+             \tis_fraud BOOLEAN,\n\
+             \tis_anomaly BOOLEAN\n\
+             );\n\
+             \\copy staging_je_line FROM 'je_line.csv' CSV HEADER;\n\
+             INSERT INTO je_line\n\
+             SELECT s.document_id, s.line_number, s.company_code, s.gl_account, s.debit_amount, s.credit_amount,\n\
+             \ts.local_amount, s.cost_center, s.profit_center, s.line_text, s.auxiliary_account_number,\n\
+             \ts.auxiliary_account_label, s.lettrage, s.lettrage_date, s.is_fraud, s.is_anomaly\n\
+             FROM staging_je_line s\n\
+             WHERE s.document_id IN (SELECT document_id FROM je_header);\n"
         )?;
     }
 
@@ -585,7 +629,7 @@ fn write_forensic_sql_provisioning(
         )?;
         writeln!(
             w,
-            "COPY employees FROM 'employees.csv' CSV HEADER;\n"
+            "\\copy employees FROM 'employees.csv' CSV HEADER;\n"
         )?;
     }
 
@@ -614,7 +658,7 @@ fn write_forensic_sql_provisioning(
         )?;
         writeln!(
             w,
-            "COPY vendors FROM 'vendors.csv' CSV HEADER;\n"
+            "\\copy vendors FROM 'vendors.csv' CSV HEADER;\n"
         )?;
     }
 
@@ -642,7 +686,7 @@ fn write_forensic_sql_provisioning(
         )?;
         writeln!(
             w,
-            "COPY customers FROM 'customers.csv' CSV HEADER;\n"
+            "\\copy customers FROM 'customers.csv' CSV HEADER;\n"
         )?;
     }
 
@@ -666,8 +710,31 @@ fn write_forensic_sql_provisioning(
         )?;
         writeln!(
             w,
-            "COPY anomaly_labels FROM 'anomaly_labels.csv' CSV HEADER;\n"
+            "\\copy anomaly_labels FROM 'anomaly_labels.csv' CSV HEADER;\n"
         )?;
+    }
+
+    // Make all created tables readable by any database user (no security requirement).
+    writeln!(
+        w,
+        "\n-- Grant read access to all forensic tables for any database user.\n\
+         GRANT USAGE ON SCHEMA public TO PUBLIC;\n"
+    )?;
+    if !result.journal_entries.is_empty() {
+        writeln!(w, "GRANT SELECT ON TABLE je_header TO PUBLIC;\n")?;
+        writeln!(w, "GRANT SELECT ON TABLE je_line TO PUBLIC;\n")?;
+    }
+    if !result.master_data.employees.is_empty() {
+        writeln!(w, "GRANT SELECT ON TABLE employees TO PUBLIC;\n")?;
+    }
+    if !result.master_data.vendors.is_empty() {
+        writeln!(w, "GRANT SELECT ON TABLE vendors TO PUBLIC;\n")?;
+    }
+    if !result.master_data.customers.is_empty() {
+        writeln!(w, "GRANT SELECT ON TABLE customers TO PUBLIC;\n")?;
+    }
+    if !result.anomaly_labels.labels.is_empty() {
+        writeln!(w, "GRANT SELECT ON TABLE anomaly_labels TO PUBLIC;\n")?;
     }
 
     w.flush()?;

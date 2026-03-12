@@ -1,0 +1,1537 @@
+global:
+  seed: null
+  industry: transportation
+  start_date: 2024-01-01
+  period_months: 12
+  group_currency: EUR
+  parallel: true
+  worker_threads: 0
+  memory_limit_mb: 0
+companies:
+- code: '2000'
+  name: FR_TransportMaster
+  currency: EUR
+  country: FR
+  fiscal_year_variant: K4
+  annual_transaction_volume: ten_k
+  volume_weight: 1
+chart_of_accounts:
+  complexity: medium
+  industry_specific: true
+  min_hierarchy_depth: 2
+  max_hierarchy_depth: 5
+  custom_accounts: null
+transactions:
+  line_item_distribution:
+    two_items: 0.6068
+    three_items: 0.0577
+    four_items: 0.1663
+    five_items: 0.0306
+    six_items: 0.0332
+    seven_items: 0.0113
+    eight_items: 0.0188
+    nine_items: 0.0042
+    ten_to_ninety_nine: 0.0633
+    hundred_to_nine_ninety_nine: 0.0076
+    thousand_plus: 0.0002
+  debit_credit_distribution:
+    equal: 0.82
+    more_debit: 0.07
+    more_credit: 0.11
+  even_odd_distribution:
+    even: 0.88
+    odd: 0.12
+  source_distribution:
+    manual: 0.05
+    automated: 0.88
+    recurring: 0.05
+    adjustment: 0.02
+  seasonality:
+    month_end_spike: true
+    month_end_multiplier: 2.5
+    month_end_lead_days: 5
+    quarter_end_spike: true
+    quarter_end_multiplier: 4.0
+    year_end_spike: true
+    year_end_multiplier: 6.0
+    weekend_activity: 0.1
+    holiday_activity: 0.05
+    day_of_week_patterns: true
+    monday_multiplier: 1.3
+    tuesday_multiplier: 1.1
+    wednesday_multiplier: 1.0
+    thursday_multiplier: 1.0
+    friday_multiplier: 0.85
+  amounts:
+    min_amount: 50.0
+    max_amount: 100000.0
+    lognormal_mu: 7.0
+    lognormal_sigma: 2.5
+    decimal_places: 2
+    round_number_probability: 0.25
+    nice_number_probability: 0.15
+  benford:
+    enabled: true
+    tolerance: 0.05
+    exempt_sources:
+    - recurring
+    - payroll
+output:
+  mode: flat_file
+  output_directory: ./output
+  formats:
+  - parquet
+  compression:
+    enabled: true
+    algorithm: zstd
+    level: 3
+  batch_size: 100000
+  include_acdoca: true
+  include_bseg: false
+  partition_by_period: true
+  partition_by_company: false
+fraud:
+  enabled: true
+  fraud_rate: 0.005
+  fraud_type_distribution:
+    suspense_account_abuse: 0.25
+    fictitious_transaction: 0.15
+    revenue_manipulation: 0.1
+    expense_capitalization: 0.1
+    split_transaction: 0.15
+    timing_anomaly: 0.1
+    unauthorized_access: 0.1
+    duplicate_payment: 0.05
+  clustering_enabled: false
+  clustering_factor: 3.0
+  approval_thresholds:
+  - 1000.0
+  - 5000.0
+  - 10000.0
+  - 25000.0
+  - 50000.0
+  - 100000.0
+data_quality:
+  enabled: true
+  preset: none
+  missing_values:
+    enabled: false
+    rate: 0.01
+    strategy: mcar
+    field_rates: {}
+    protected_fields:
+    - document_id
+    - company_code
+    - posting_date
+  typos:
+    enabled: false
+    char_error_rate: 0.001
+    type_weights:
+      substitution: 0.35
+      transposition: 0.25
+      insertion: 0.1
+      deletion: 0.15
+      ocr_errors: 0.1
+      homophones: 0.05
+    protected_fields:
+    - document_id
+    - gl_account
+    - company_code
+  format_variations:
+    enabled: true
+    dates:
+      enabled: true
+      rate: 0.05
+      iso_format: false
+      us_format: false
+      eu_format: true
+      long_format: false
+    amounts:
+      enabled: true
+      rate: 0.02
+      us_comma_format: false
+      eu_format: true
+      currency_prefix: false
+      accounting_format: false
+    identifiers:
+      enabled: false
+      rate: 0.02
+      case_variations: false
+      padding_variations: false
+      separator_variations: false
+  duplicates:
+    enabled: false
+    rate: 0.005
+    exact_duplicate_ratio: 0.4
+    near_duplicate_ratio: 0.35
+    fuzzy_duplicate_ratio: 0.25
+    max_date_offset_days: 3
+    max_amount_variance: 0.01
+  encoding_issues:
+    enabled: false
+    rate: 0.001
+    mojibake: false
+    html_entities: false
+    bom_issues: false
+  generate_labels: true
+  sink_profiles:
+    csv: null
+    json: null
+    parquet: null
+internal_controls:
+  enabled: false
+  exception_rate: 0.02
+  sod_violation_rate: 0.01
+  export_control_master_data: true
+  sox_materiality_threshold: 10000.0
+  coso_enabled: true
+  include_entity_level_controls: false
+  target_maturity_level: mixed
+business_processes:
+  o2c_weight: 0.25
+  p2p_weight: 0.4
+  r2r_weight: 0.15
+  h2r_weight: 0.1
+  a2r_weight: 0.1
+user_personas:
+  persona_distribution:
+    junior_accountant: 0.15
+    senior_accountant: 0.15
+    controller: 0.05
+    manager: 0.05
+    automated_system: 0.6
+  users_per_persona:
+    junior_accountant: 10
+    senior_accountant: 5
+    controller: 2
+    manager: 3
+    automated_system: 20
+templates:
+  names:
+    culture_distribution:
+      western_us: 0.05
+      hispanic: 0.02
+      german: 0.08
+      french: 0.75
+      chinese: 0.02
+      japanese: 0.02
+      indian: 0.06
+    email_domain: fr_transportmaster.fr
+    generate_realistic_names: true
+  descriptions:
+    generate_header_text: true
+    generate_line_text: true
+  references:
+    generate_references: true
+    invoice_prefix: INV
+    po_prefix: PO
+    so_prefix: SO
+approval:
+  enabled: false
+  auto_approve_threshold: 1000.0
+  rejection_rate: 0.02
+  revision_rate: 0.05
+  average_approval_delay_hours: 4.0
+  thresholds:
+  - amount: 1000.0
+    level: 1
+    roles:
+    - senior_accountant
+  - amount: 10000.0
+    level: 2
+    roles:
+    - senior_accountant
+    - controller
+  - amount: 100000.0
+    level: 3
+    roles:
+    - senior_accountant
+    - controller
+    - manager
+  - amount: 500000.0
+    level: 4
+    roles:
+    - senior_accountant
+    - controller
+    - manager
+    - executive
+departments:
+  enabled: false
+  headcount_multiplier: 1.0
+  custom_departments: []
+master_data:
+  vendors:
+    count: 500
+    intercompany_percent: 0.05
+    payment_terms_distribution:
+      net_30: 0.4
+      net_60: 0.2
+      net_90: 0.1
+      two_ten_net_30: 0.15
+      due_on_receipt: 0.05
+      end_of_month: 0.1
+    behavior_distribution:
+      reliable: 0.5
+      sometimes_late: 0.2
+      inconsistent_quality: 0.1
+      premium: 0.1
+      budget: 0.1
+    generate_bank_accounts: true
+    generate_tax_ids: true
+  customers:
+    count: 2000
+    intercompany_percent: 0.05
+    credit_rating_distribution:
+      aaa: 0.05
+      aa: 0.1
+      a: 0.2
+      bbb: 0.3
+      bb: 0.2
+      b: 0.1
+      below_b: 0.05
+    payment_behavior_distribution:
+      early_payer: 0.1
+      on_time: 0.5
+      occasional_late: 0.25
+      frequent_late: 0.1
+      discount_taker: 0.05
+    generate_credit_limits: true
+  materials:
+    count: 5000
+    type_distribution:
+      raw_material: 0.3
+      semi_finished: 0.15
+      finished_good: 0.25
+      trading_good: 0.15
+      operating_supply: 0.1
+      service: 0.05
+    valuation_distribution:
+      standard_cost: 0.5
+      moving_average: 0.3
+      fifo: 0.15
+      lifo: 0.05
+    bom_percent: 0.2
+    max_bom_depth: 3
+  fixed_assets:
+    count: 800
+    class_distribution:
+      buildings: 0.15
+      machinery: 0.3
+      vehicles: 0.15
+      it_equipment: 0.2
+      furniture: 0.1
+      land: 0.05
+      leasehold: 0.05
+    depreciation_distribution:
+      straight_line: 0.6
+      declining_balance: 0.2
+      double_declining: 0.1
+      sum_of_years: 0.05
+      units_of_production: 0.05
+    fully_depreciated_percent: 0.15
+    generate_acquisition_history: true
+  employees:
+    count: 1500
+    generate_hierarchy: true
+    max_hierarchy_depth: 6
+    average_span_of_control: 5.0
+    approval_limits:
+      staff: 1000.0
+      senior: 5000.0
+      manager: 25000.0
+      director: 100000.0
+      vp: 500000.0
+      executive: .inf
+    department_distribution:
+      finance: 0.12
+      procurement: 0.1
+      sales: 0.25
+      warehouse: 0.15
+      it: 0.1
+      hr: 0.05
+      operations: 0.2
+      executive: 0.03
+  cost_centers:
+    count: 50
+    generate_hierarchy: true
+    max_hierarchy_depth: 3
+document_flows:
+  # Share of target total entries from document-flow JEs (P2P+O2C). E.g. 0.10 = 10%: with hundred_k (100K) -> 10K process entries; at 4 entries/chain -> 2_500 chains total, split by p2p_share
+  # entry_share: 0.4
+  # entries_per_chain_avg: 4
+  # p2p_share: 0.5
+  # Optional: set p2p_chains/o2c_chains explicitly instead of entry_share (leave entry_share unset)
+  p2p_chains: 100
+  o2c_chains: 400
+  p2p:
+    enabled: true
+    three_way_match_rate: 0.95
+    partial_delivery_rate: 0.15
+    price_variance_rate: 0.08
+    max_price_variance_percent: 0.05
+    quantity_variance_rate: 0.05
+    average_po_to_gr_days: 14
+    average_gr_to_invoice_days: 5
+    average_invoice_to_payment_days: 30
+    line_count_distribution:
+      min_lines: 1
+      max_lines: 20
+      mode_lines: 3
+    payment_behavior:
+      late_payment_rate: 0.15
+      late_payment_days_distribution:
+        slightly_late_1_to_7: 0.5
+        late_8_to_14: 0.25
+        very_late_15_to_30: 0.15
+        severely_late_31_to_60: 0.07
+        extremely_late_over_60: 0.03
+      partial_payment_rate: 0.05
+      payment_correction_rate: 0.02
+  o2c:
+    enabled: true
+    credit_check_failure_rate: 0.02
+    partial_shipment_rate: 0.1
+    return_rate: 0.03
+    bad_debt_rate: 0.01
+    average_so_to_delivery_days: 7
+    average_delivery_to_invoice_days: 1
+    average_invoice_to_receipt_days: 45
+    line_count_distribution:
+      min_lines: 1
+      max_lines: 20
+      mode_lines: 3
+    cash_discount:
+      eligible_rate: 0.3
+      taken_rate: 0.6
+      discount_percent: 0.02
+      discount_days: 10
+    payment_behavior:
+      dunning:
+        enabled: false
+        level_1_days_overdue: 14
+        level_2_days_overdue: 28
+        level_3_days_overdue: 42
+        collection_days_overdue: 60
+        payment_after_dunning_rates:
+          after_level_1: 0.4
+          after_level_2: 0.3
+          after_level_3: 0.15
+          during_collection: 0.05
+          never_pay: 0.1
+        dunning_block_rate: 0.05
+        interest_rate_per_year: 0.09
+        dunning_charge: 25.0
+      partial_payments:
+        rate: 0.08
+        percentage_distribution:
+          pay_25_percent: 0.15
+          pay_50_percent: 0.5
+          pay_75_percent: 0.25
+          pay_random_percent: 0.1
+        avg_days_until_remainder: 30
+      short_payments:
+        rate: 0.03
+        reason_distribution:
+          pricing_dispute: 0.3
+          quality_issue: 0.2
+          quantity_discrepancy: 0.2
+          unauthorized_deduction: 0.15
+          incorrect_discount: 0.15
+        max_short_percent: 0.1
+      on_account_payments:
+        rate: 0.02
+        avg_days_until_applied: 14
+      payment_corrections:
+        rate: 0.02
+        type_distribution:
+          nsf: 0.3
+          chargeback: 0.2
+          wrong_amount: 0.2
+          wrong_customer: 0.15
+          duplicate_payment: 0.15
+  generate_document_references: true
+  export_flow_graph: true
+intercompany:
+  enabled: false
+  ic_transaction_rate: 0.15
+  transfer_pricing_method: cost_plus
+  markup_percent: 0.05
+  generate_matched_pairs: true
+  transaction_type_distribution:
+    goods_sale: 0.35
+    service_provided: 0.2
+    loan: 0.1
+    dividend: 0.05
+    management_fee: 0.15
+    royalty: 0.1
+    cost_sharing: 0.05
+  generate_eliminations: false
+balance:
+  generate_opening_balances: false
+  generate_trial_balances: true
+  target_gross_margin: 0.35
+  target_dso_days: 45
+  target_dpo_days: 30
+  target_current_ratio: 1.5
+  target_debt_to_equity: 0.5
+  validate_balance_equation: true
+  reconcile_subledgers: true
+ocpm:
+  enabled: true
+  generate_lifecycle_events: true
+  include_object_relationships: true
+  compute_variants: true
+  max_variants: 0
+  p2p_process:
+    rework_probability: 0.05
+    skip_step_probability: 0.02
+    out_of_order_probability: 0.03
+  o2c_process:
+    rework_probability: 0.05
+    skip_step_probability: 0.02
+    out_of_order_probability: 0.03
+  output:
+    ocel_json: true
+    ocel_xml: false
+    xes: false
+    xes_include_lifecycle: true
+    xes_include_resources: true
+    flattened_csv: true
+    event_object_csv: true
+    object_relationship_csv: true
+    variants_csv: true
+    export_reference_models: false
+audit:
+  enabled: false
+  generate_workpapers: true
+  engagement_types:
+    financial_statement: 0.4
+    sox_icfr: 0.2
+    integrated: 0.25
+    review: 0.1
+    agreed_upon_procedures: 0.05
+  workpapers:
+    average_per_phase: 5
+    include_isa_references: true
+    include_sample_details: true
+    include_cross_references: true
+    sampling:
+      statistical_rate: 0.4
+      judgmental_rate: 0.3
+      haphazard_rate: 0.2
+      complete_examination_rate: 0.1
+  team:
+    min_team_size: 3
+    max_team_size: 8
+    specialist_probability: 0.3
+  review:
+    average_review_delay_days: 2
+    rework_probability: 0.15
+    require_partner_signoff: true
+banking:
+  enabled: true
+  population:
+    retail_customers: 10000
+    retail_persona_weights:
+      student: 0.15
+      gig_worker: 0.1
+      retiree: 0.15
+      mid_career: 0.3
+      high_net_worth: 0.05
+      early_career: 0.25
+    business_customers: 1000
+    business_persona_weights:
+      small_business: 0.5
+      import_export: 0.05
+      enterprise: 0.05
+      cash_intensive: 0.1
+      professional_services: 0.05
+      mid_market: 0.25
+    trusts: 100
+    household_rate: 0.4
+    avg_household_size: 2.3
+    period_months: 12
+    start_date: 2024-01-01
+  products:
+    cash_intensity: 0.15
+    cross_border_rate: 0.05
+    card_vs_transfer: 0.6
+    avg_accounts_retail: 1.5
+    avg_accounts_business: 2.5
+    debit_card_rate: 0.85
+    international_rate: 0.1
+  compliance:
+    risk_appetite: medium
+    kyc_completeness: 0.95
+    high_risk_tolerance: 0.05
+    pep_rate: 0.01
+    edd_threshold: 50000
+  typologies:
+    suspicious_rate: 0.02
+    structuring_rate: 0.004
+    funnel_rate: 0.003
+    layering_rate: 0.003
+    mule_rate: 0.005
+    fraud_rate: 0.005
+    sophistication:
+      basic: 0.4
+      standard: 0.35
+      professional: 0.2
+      advanced: 0.05
+    detectability: 0.5
+    round_tripping_rate: 0.001
+    trade_based_rate: 0.001
+  spoofing:
+    enabled: true
+    intensity: 0.3
+    spoof_timing: true
+    spoof_amounts: true
+    spoof_merchants: true
+    spoof_geography: false
+    add_delays: true
+  output:
+    directory: banking
+    include_customers: true
+    include_accounts: true
+    include_transactions: true
+    include_counterparties: true
+    include_beneficial_ownership: true
+    include_transaction_labels: true
+    include_entity_labels: true
+    include_relationship_labels: true
+    include_case_narratives: true
+    include_graph: true
+scenario:
+  tags: []
+  profile: null
+  description: null
+  ml_training: false
+  target_anomaly_ratio: null
+  metadata: {}
+temporal:
+  enabled: false
+  amount_mean_drift: 0.02
+  amount_variance_drift: 0.0
+  anomaly_rate_drift: 0.0
+  concept_drift_rate: 0.01
+  sudden_drift_probability: 0.0
+  sudden_drift_magnitude: 2.0
+  seasonal_drift: false
+  drift_start_period: 0
+  drift_type: gradual
+graph_export:
+  enabled: false
+  graph_types:
+  - name: accounting_network
+    aggregate_edges: false
+    min_edge_weight: 0.0
+    include_document_nodes: false
+  formats:
+  - pytorch_geometric
+  train_ratio: 0.7
+  validation_ratio: 0.15
+  split_seed: null
+  output_subdirectory: graphs
+  hypergraph:
+    enabled: false
+    max_nodes: 50000
+    aggregation_strategy: pool_by_counterparty
+    governance_layer:
+      include_coso: true
+      include_controls: true
+      include_sox: true
+      include_vendors: true
+      include_customers: true
+      include_employees: true
+    process_layer:
+      include_p2p: true
+      include_o2c: true
+      include_s2c: true
+      include_h2r: true
+      include_mfg: true
+      include_bank: true
+      include_audit: true
+      include_r2r: true
+      events_as_hyperedges: true
+      docs_per_counterparty_threshold: 20
+    accounting_layer:
+      include_accounts: true
+      je_as_hyperedges: true
+    cross_layer:
+      enabled: true
+    output_subdirectory: hypergraph
+    output_format: native
+    stream_target: null
+    stream_batch_size: 1000
+streaming:
+  enabled: false
+  buffer_size: 1000
+  enable_progress: true
+  progress_interval: 100
+  backpressure: block
+rate_limit:
+  enabled: false
+  entities_per_second: 1000.0
+  burst_size: 100
+  backpressure: block
+temporal_attributes:
+  enabled: false
+  valid_time:
+    closed_probability: 0.1
+    avg_validity_days: 365
+    validity_stddev_days: 90
+  transaction_time:
+    avg_recording_delay_seconds: 0
+    allow_backdating: false
+    backdating_probability: 0.01
+    max_backdate_days: 30
+  generate_version_chains: false
+  avg_versions_per_entity: 1.5
+relationships:
+  relationship_types: []
+  allow_orphans: true 
+  orphan_probability: 0.01
+  allow_circular: false
+  max_circular_depth: 3
+accounting_standards:
+  enabled: true
+  framework: french_gaap
+  revenue_recognition:
+    enabled: true
+    generate_contracts: true
+    avg_obligations_per_contract: 2.0
+    variable_consideration_rate: 0.15
+    over_time_recognition_rate: 0.3
+    contract_count: 100
+  leases:
+    enabled: true
+    lease_count: 50
+    finance_lease_percent: 0.3
+    avg_lease_term_months: 60
+    generate_amortization: true
+    real_estate_percent: 0.4
+  fair_value:
+    enabled: false
+    measurement_count: 25
+    level1_percent: 0.4
+    level2_percent: 0.35
+    level3_percent: 0.25
+    include_sensitivity_analysis: false
+  impairment:
+    enabled: false
+    test_count: 15
+    impairment_rate: 0.1
+    generate_projections: true
+    include_goodwill: false
+  generate_differences: false
+audit_standards:
+  enabled: false
+  isa_compliance:
+    enabled: false
+    compliance_level: standard
+    generate_isa_mappings: true
+    generate_coverage_summary: true
+    include_pcaob: false
+    framework: isa
+  analytical_procedures:
+    enabled: false
+    procedures_per_account: 3
+    variance_probability: 0.2
+    generate_investigations: true
+    include_ratio_analysis: true
+  confirmations:
+    enabled: false
+    confirmation_count: 50
+    positive_response_rate: 0.85
+    exception_rate: 0.1
+    non_response_rate: 0.05
+    generate_alternative_procedures: true
+  opinion:
+    enabled: false
+    generate_kam: true
+    average_kam_count: 3
+    modified_opinion_rate: 0.05
+    include_emphasis_of_matter: false
+    include_going_concern: true
+  generate_audit_trail: false
+  sox:
+    enabled: false
+    generate_302_certifications: true
+    generate_404_assessments: true
+    materiality_threshold: 10000.0
+    material_weakness_rate: 0.02
+    significant_deficiency_rate: 0.08
+  pcaob:
+    enabled: false
+    is_pcaob_audit: false
+    generate_cam: true
+    include_icfr_opinion: false
+    generate_standard_mappings: false
+distributions:
+  enabled: false
+  amounts:
+    enabled: false
+    distribution_type: log_normal
+    components: []
+    min_value: 0.01
+    max_value: null
+    decimal_places: 2
+  correlations:
+    enabled: false
+    copula_type: gaussian
+    fields: []
+    matrix: []
+    expected_correlations: []
+  conditional: []
+  regime_changes:
+    enabled: false
+    changes: []
+    economic_cycle: null
+    parameter_drifts: []
+  industry_profile: null
+  validation:
+    enabled: false
+    tests: []
+    reporting:
+      output_report: false
+      format: jsonWrite a n
+    half_day_policy: half_day
+    settlement_rules:
+      equity_days: 2
+      government_bonds_days: 1
+      fx_spot_days: 2
+      corporate_bonds_days: 2
+      wire_cutoff_time: 14:00
+      wire_international_days: 1
+      ach_days: 1
+    month_end_convention: modified_following
+    weekend_days: null
+  calendars:
+    regions: [DE]
+    custom_holidays: []
+  period_end:
+    model: null
+    month_end: null
+    quarter_end: null
+    year_end: null
+  processing_lags:
+    enabled: true
+    sales_order_lag: null
+    purchase_order_lag: null
+    goods_receipt_lag: null
+    invoice_receipt_lag: null
+    invoice_issue_lag: null
+    payment_lag: null
+    journal_entry_lag: null
+    cross_day_posting: null
+  fiscal_calendar:
+    enabled: false
+    calendar_type: ''
+    year_start_month: null
+    year_start_day: null
+    four_four_five: null
+  intraday:
+    enabled: false
+    segments: []
+  timezones:
+    enabled: true
+    default_timezone: Europe/Paris
+    consolidation_timezone: Europe/Paris
+    entity_mappings: []
+vendor_network:
+  enabled: false
+  depth: 3
+  tier1:
+    min: 50
+    max: 100
+  tier2_per_parent:
+    min: 4
+    max: 10
+  tier3_per_parent:
+    min: 2
+    max: 5
+  clusters:
+    reliable_strategic: 0.2
+    standard_operational: 0.5
+    transactional: 0.25
+    problematic: 0.05
+  dependencies:
+    max_single_vendor_concentration: 0.15
+    top_5_concentration: 0.45
+    single_source_percent: 0.05
+customer_segmentation:
+  enabled: false
+  value_segments:
+    enterprise:
+      revenue_share: 0.4
+      customer_share: 0.05
+      avg_order_value_range: 50000+
+    mid_market:
+      revenue_share: 0.35
+      customer_share: 0.2
+      avg_order_value_range: 5000-50000
+    smb:
+      revenue_share: 0.2
+      customer_share: 0.5
+      avg_order_value_range: 500-5000
+    consumer:
+      revenue_share: 0.05
+      customer_share: 0.25
+      avg_order_value_range: 50-500
+  lifecycle:
+    prospect_rate: 0.0
+    new_rate: 0.1
+    growth_rate: 0.15
+    mature_rate: 0.6
+    at_risk_rate: 0.1
+    churned_rate: 0.05
+  networks:
+    referrals:
+      enabled: true
+      referral_rate: 0.15
+    corporate_hierarchies:
+      enabled: true
+      probability: 0.3
+relationship_strength:
+  enabled: false
+  calculation:
+    transaction_volume_weight: 0.3
+    transaction_count_weight: 0.25
+    relationship_duration_weight: 0.2
+    recency_weight: 0.15
+    mutual_connections_weight: 0.1
+    recency_half_life_days: 90
+  thresholds:
+    strong: 0.7
+    moderate: 0.4
+    weak: 0.1
+cross_process_links:
+  enabled: false
+  inventory_p2p_o2c: true
+  payment_bank_reconciliation: true
+  intercompany_bilateral: true
+  inventory_link_rate: 0.3
+organizational_events:
+  enabled: false
+  effect_blending: multiplicative
+  events: []
+  process_evolution: []
+  technology_transitions: []
+behavioral_drift:
+  enabled: false
+  vendor_behavior:
+    payment_terms_drift:
+      extension_rate_per_year: 2.5
+      economic_sensitivity: 1.0
+    quality_drift:
+      new_vendor_improvement_rate: 0.02
+      complacency_decline_rate: 0.01
+  customer_behavior:
+    payment_drift:
+      downturn_days_extension:
+      - 5
+      - 15
+      downturn_bad_debt_increase: 0.02
+    order_drift:
+      digital_shift_rate: 0.05
+  employee_behavior:
+    approval_drift:
+      eom_intensity_increase_per_year: 0.05
+      rubber_stamp_volume_threshold: 50
+    error_drift:
+      new_employee_error_rate: 0.08
+      learning_curve_months: 6
+  collective:
+    automation_adoption:
+      s_curve_enabled: false
+      adoption_midpoint_months: 24
+      steepness: 0.15
+market_drift:
+  enabled: false
+  economic_cycle:
+    enabled: false
+    cycle_type: sinusoidal
+    period_months: 48
+    amplitude: 0.15
+    recession:
+      enabled: false
+      probability_per_year: 0.1
+      severity: moderate
+      recession_periods: []
+  industry_cycles: {}
+  commodities:
+    enabled: false
+    items: []
+drift_labeling:
+  enabled: true
+  statistical:
+    enabled: true
+    min_magnitude_threshold: 0.05
+  categorical:
+    enabled: true
+  temporal:
+    enabled: true
+  regulatory_calendar_preset: null
+anomaly_injection:
+  enabled: true
+  rates:
+    total_rate: 0.03
+    fraud_rate: 0.01
+    error_rate: 0.015
+    process_rate: 0.005
+  multi_stage_schemes:
+    enabled: true
+    embezzlement:
+      probability: 0.5
+      testing_stage:
+        duration_months: 2
+        amount_min: 100.0
+        amount_max: 500.0
+        transaction_count_min: 2
+        transaction_count_max: 5
+        difficulty: hard
+      escalation_stage:
+        duration_months: 6
+        amount_min: 500.0
+        amount_max: 2000.0
+        transaction_count_min: 3
+        transaction_count_max: 8
+        difficulty: moderate
+      acceleration_stage:
+        duration_months: 3
+        amount_min: 2000.0
+        amount_max: 10000.0
+        transaction_count_min: 5
+        transaction_count_max: 12
+        difficulty: easy
+      desperation_stage:
+        duration_months: 1
+        amount_min: 10000.0
+        amount_max: 50000.0
+        transaction_count_min: 3
+        transaction_count_max: 6
+        difficulty: trivial
+    revenue_manipulation:
+      probability: 0.01
+      early_recognition_target: 0.02
+      expense_deferral_target: 0.03
+      reserve_release_target: 0.02
+      channel_stuffing_target: 0.05
+    kickback:
+      probability: 0.01
+      inflation_min: 0.1
+      inflation_max: 0.25
+      kickback_percent: 0.5
+      setup_months: 3
+      operation_months: 12
+  correlated_injection:
+    enabled: true
+    fraud_concealment: true
+    error_cascade: true
+    temporal_clustering: true
+    temporal_clustering_config:
+      period_end_multiplier: 2.5
+      period_end_days: 5
+      quarter_end_multiplier: 1.5
+      year_end_multiplier: 2.0
+    co_occurrence_patterns: []
+  near_miss:
+    enabled: false
+    proportion: 0.3
+    near_duplicate: true
+    near_duplicate_days:
+      min: 1
+      max: 3
+    threshold_proximity: true
+    threshold_proximity_range:
+      min: 0.9
+      max: 0.99
+    unusual_legitimate: true
+    unusual_legitimate_types:
+    - year_end_bonus
+    - contract_prepayment
+    - insurance_claim
+    - settlement_payment
+    corrected_errors: true
+    corrected_error_lag:
+      min: 1
+      max: 5
+  difficulty_classification:
+    enabled: true
+    target_distribution:
+      trivial: 0.15
+      easy: 0.25
+      moderate: 0.3
+      hard: 0.2
+      expert: 0.1
+  context_aware:
+    enabled: false
+    vendor_rules:
+      new_vendor_error_multiplier: 2.5
+      new_vendor_threshold_days: 90
+      international_error_multiplier: 1.5
+      strategic_vendor_anomaly_types:
+      - pricing_dispute
+      - contract_violation
+    employee_rules:
+      new_employee_error_rate: 0.05
+      new_employee_threshold_days: 180
+      volume_fatigue_threshold: 50
+      coverage_error_multiplier: 1.8
+    account_rules:
+      high_risk_account_multiplier: 2.0
+      high_risk_accounts:
+      - '1100'
+      - '2000'
+      - '3000'
+      suspense_account_multiplier: 3.0
+      suspense_accounts:
+      - '9999'
+      - '9998'
+      intercompany_account_multiplier: 1.5
+    behavioral_baseline:
+      enabled: false
+      baseline_period_days: 90
+      deviation_threshold_std: 3.0
+      frequency_deviation_threshold: 2.0
+  labeling:
+    severity_scoring: true
+    difficulty_classification: true
+    materiality_thresholds:
+      trivial: 0.001
+      immaterial: 0.01
+      material: 0.05
+      highly_material: 0.1
+industry_specific:
+  enabled: false
+  manufacturing:
+    enabled: false
+    bom_depth: 4
+    just_in_time: false
+    production_order_types:
+    - standard
+    - rework
+    - prototype
+    quality_framework: ISO_9001
+    supplier_tiers: 2
+    standard_cost_frequency: quarterly
+    target_yield_rate: 0.97
+    scrap_alert_threshold: 0.03
+    anomaly_rates:
+      yield_manipulation: 0.015
+      labor_misallocation: 0.02
+      phantom_production: 0.005
+      standard_cost_manipulation: 0.01
+      inventory_fraud: 0.008
+  retail:
+    enabled: false
+    store_types:
+      flagship: 0.1
+      regional: 0.5
+      outlet: 0.25
+      ecommerce: 0.15
+    avg_daily_transactions: 500
+    loss_prevention: true
+    shrinkage_rate: 0.015
+    anomaly_rates:
+      sweethearting: 0.02
+      skimming: 0.005
+      refund_fraud: 0.015
+      void_abuse: 0.01
+      gift_card_fraud: 0.008
+      vendor_kickback: 0.003
+  healthcare:
+    enabled: false
+    facility_type: hospital
+    payer_mix:
+      medicare: 0.4
+      medicaid: 0.2
+      commercial: 0.3
+      self_pay: 0.1
+    coding_systems:
+      icd10: true
+      cpt: true
+      drg: true
+      hcpcs: true
+      revenue_codes: true
+    compliance:
+      hipaa: true
+      stark_law: true
+      anti_kickback: true
+      false_claims_act: true
+      emtala: true
+    avg_daily_encounters: 150
+    avg_charges_per_encounter: 8
+    denial_rate: 0.05
+    bad_debt_rate: 0.03
+    charity_care_rate: 0.02
+    anomaly_rates:
+      upcoding: 0.02
+      unbundling: 0.015
+      phantom_billing: 0.005
+      kickbacks: 0.003
+      duplicate_billing: 0.008
+      medical_necessity_abuse: 0.01
+  technology:
+    enabled: false
+    revenue_model: saas
+    subscription_revenue_pct: 0.6
+    license_revenue_pct: 0.25
+    services_revenue_pct: 0.15
+    rd_capitalization:
+      enabled: true
+      capitalization_rate: 0.3
+      useful_life_years: 3
+    anomaly_rates:
+      premature_revenue: 0.015
+      side_letter_abuse: 0.008
+      channel_stuffing: 0.01
+      improper_capitalization: 0.012
+  financial_services:
+    enabled: true
+    institution_type: commercial_bank
+    regulatory_framework: us_banking
+    anomaly_rates:
+      loan_fraud: 0.01
+      trading_fraud: 0.008
+      insurance_fraud: 0.012
+      account_manipulation: 0.005
+  professional_services:
+    enabled: false
+    firm_type: consulting
+    billing_model: time_and_materials
+    avg_hourly_rate: 250.0
+    trust_accounting:
+      enabled: false
+      require_three_way_reconciliation: true
+    anomaly_rates:
+      time_billing_fraud: 0.02
+      expense_fraud: 0.015
+      trust_misappropriation: 0.003
+fingerprint_privacy:
+  level: standard
+  epsilon: 1.0
+  delta: 0.00001
+  k_anonymity: 5
+  composition_method: naive
+quality_gates:
+  enabled: false
+  profile: default
+  fail_on_violation: false
+  custom_gates: []
+compliance:
+  content_marking:
+    enabled: true
+    format: embedded
+  article10_report: false
+  certificates:
+    enabled: false
+    signing_key_env: null
+    include_quality_metrics: false
+webhooks:
+  enabled: false
+  endpoints: []
+llm:
+  enabled: false
+  provider: mock
+  model: gpt-4o-mini
+  max_vendor_enrichments: 50
+diffusion:
+  enabled: false
+  n_steps: 100
+  schedule: linear
+  sample_size: 100
+causal:
+  enabled: false
+  template: fraud_detection
+  sample_size: 500
+  validate: true
+source_to_pay:
+  enabled: false
+  spend_analysis:
+    hhi_threshold: 2500.0
+    contract_coverage_target: 0.8
+  sourcing:
+    projects_per_year: 10
+    renewal_horizon_months: 3
+    project_duration_months: 4
+  qualification:
+    pass_rate: 0.75
+    validity_days: 365
+    financial_weight: 0.25
+    quality_weight: 0.3
+    delivery_weight: 0.25
+    compliance_weight: 0.2
+  rfx:
+    rfi_threshold: 100000.0
+    min_invited_vendors: 3
+    max_invited_vendors: 8
+    response_rate: 0.7
+    default_price_weight: 0.4
+    default_quality_weight: 0.35
+    default_delivery_weight: 0.25
+  contracts:
+    min_duration_months: 12
+    max_duration_months: 36
+    auto_renewal_rate: 0.4
+    amendment_rate: 0.2
+    type_distribution:
+      fixed_price: 0.4
+      blanket: 0.3
+      time_and_materials: 0.15
+      service_agreement: 0.15
+  catalog:
+    preferred_vendor_flag_rate: 0.7
+    multi_source_rate: 0.25
+  scorecards:
+    frequency: quarterly
+    on_time_delivery_weight: 0.3
+    quality_weight: 0.3
+    price_weight: 0.25
+    responsiveness_weight: 0.15
+    grade_a_threshold: 90.0
+    grade_b_threshold: 75.0
+    grade_c_threshold: 60.0
+  p2p_integration:
+    off_contract_rate: 0.15
+    price_tolerance: 0.02
+    catalog_enforcement: false
+financial_reporting:
+  enabled: false
+  generate_balance_sheet: true
+  generate_income_statement: true
+  generate_cash_flow: true
+  generate_changes_in_equity: true
+  comparative_periods: 1
+  management_kpis:
+    enabled: false
+    frequency: ''
+  budgets:
+    enabled: false
+    revenue_growth_rate: 0.05
+    expense_inflation_rate: 0.03
+    variance_noise: 0.1
+hr:
+  enabled: false
+  payroll:
+    enabled: true
+    pay_frequency: monthly
+    salary_ranges:
+      staff_min: 50000.0
+      staff_max: 70000.0
+      manager_min: 80000.0
+      manager_max: 120000.0
+      director_min: 120000.0
+      director_max: 180000.0
+      executive_min: 180000.0
+      executive_max: 350000.0
+    tax_rates:
+      federal_effective: 0.22
+      state_effective: 0.05
+      fica: 0.0765
+    benefits_enrollment_rate: 0.6
+    retirement_participation_rate: 0.45
+  time_attendance:
+    enabled: true
+    overtime_rate: 0.1
+  expenses:
+    enabled: true
+    submission_rate: 0.3
+    policy_violation_rate: 0.08
+manufacturing:
+  enabled: false
+  production_orders:
+    orders_per_month: 50
+    avg_batch_size: 100
+    yield_rate: 0.97
+    make_to_order_rate: 0.2
+    rework_rate: 0.03
+  costing:
+    labor_rate_per_hour: 35.0
+    overhead_rate: 1.5
+    standard_cost_update_frequency: quarterly
+  routing:
+    avg_operations: 4
+    setup_time_hours: 1.5
+    run_time_variation: 0.15
+sales_quotes:
+  enabled: false
+  quotes_per_month: 30
+  win_rate: 0.35
+  validity_days: 30
+tax:
+  enabled: true
+  jurisdictions:
+    countries:
+    - US
+    - DE
+    - CN
+    include_subnational: true
+  vat_gst:
+    enabled: true
+    standard_rates: {}
+    reduced_rates: {}
+    exempt_categories: []
+    reverse_charge: true
+  sales_tax:
+    enabled: false
+    nexus_states: []
+  withholding:
+    enabled: true
+    treaty_network: true
+    default_rate: 0.3
+    treaty_reduced_rate: 0.15
+  provisions:
+    enabled: true
+    statutory_rate: 0.21
+    uncertain_positions: true
+  payroll_tax:
+    enabled: false
+  anomaly_rate: 0.03
+treasury:
+  enabled: true
+  cash_positioning:
+    enabled: true
+    frequency: daily
+    minimum_balance_policy: 100000.0
+  cash_forecasting:
+    enabled: true
+    horizon_days: 90
+    ar_collection_probability_curve: aging
+    confidence_interval: 0.9
+  cash_pooling:
+    enabled: false
+    pool_type: zero_balancing
+    sweep_time: 16:00
+  hedging:
+    enabled: true
+    hedge_ratio: 0.7
+    instruments:
+    - fx_forward
+    - interest_rate_swap
+    hedge_accounting: true
+    effectiveness_method: regression
+  debt:
+    enabled: true
+    instruments: []
+    covenants: []
+  netting:
+    enabled: false
+    cycle: monthly
+  bank_guarantees:
+    enabled: false
+    count: 5
+  anomaly_rate: 0.02
+project_accounting:
+  enabled: true
+  project_count: 15
+  project_types:
+    capital: 0.35
+    internal: 0.15
+    customer: 0.2
+    r_and_d: 0.1
+    maintenance: 0.15
+    technology: 0.05
+  wbs:
+    max_depth: 3
+    min_elements_per_level: 2
+    max_elements_per_level: 6
+  cost_allocation:
+    time_entry_project_rate: 0.6
+    expense_project_rate: 0.3
+    purchase_order_project_rate: 0.4
+    vendor_invoice_project_rate: 0.35
+  revenue_recognition:
+    enabled: true
+    method: percentage_of_completion
+    completion_measure: cost_to_cost
+    avg_contract_value: 500000.0
+  milestones:
+    enabled: true
+    avg_per_project: 4
+    payment_milestone_rate: 0.5
+  change_orders:
+    enabled: true
+    probability: 0.4
+    max_per_project: 3
+    approval_rate: 0.75
+  retainage:
+    enabled: false
+    default_percentage: 0.1
+  earned_value:
+    enabled: true
+    frequency: monthly
+  anomaly_rate: 0.03
+esg:
+  enabled: true
+  environmental:
+    enabled: true
+    scope1:
+      enabled: true
+      factor_region: US
+    scope2:
+      enabled: true
+      factor_region: US
+    scope3:
+      enabled: true
+      categories:
+      - purchased_goods
+      - business_travel
+      - employee_commuting
+      default_spend_intensity_kg_per_f: 0.5
+    energy:
+      enabled: true
+      facility_count: 5
+      renewable_target: 0.3
+    water:
+      enabled: true
+      facility_count: 3
+    waste:
+      enabled: true
+      diversion_target: 0.5
+  social:
+    enabled: true
+    diversity:
+      enabled: true
+      dimensions:
+      - gender
+      - ethnicity
+      - age_group
+    pay_equity:
+      enabled: true
+      gap_threshold: 0.05
+    safety:
+      enabled: true
+      target_trir: 2.5
+      incident_count: 20
+  governance:
+    enabled: true
+    board_size: 11
+    independence_target: 0.67
+  supply_chain_esg:
+    enabled: true
+    assessment_coverage: 0.9
+    high_risk_countries:
+    - CN
+    - BD
+    - MM
+    - VN
+  reporting:
+    enabled: true
+    frameworks:
+    - GRI
+    - ESRS
+    materiality_assessment: true
+    impact_threshold: 0.6
+    financial_threshold: 0.6
+  climate_scenarios:
+    enabled: true
+    scenarios:
+    - net_zero_2050
+    - stated_policies
+    - current_trajectory
+    time_horizons:
+    - 5
+    - 10
+    - 30
+  anomaly_rate: 0.02

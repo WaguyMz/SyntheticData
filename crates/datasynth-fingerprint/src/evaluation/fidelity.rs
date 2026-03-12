@@ -92,11 +92,15 @@ impl Default for FidelityConfig {
     fn default() -> Self {
         Self {
             threshold: 0.8,
-            statistical_weight: 0.30,
-            correlation_weight: 0.20,
-            schema_weight: 0.20,
-            rule_weight: 0.20,
-            anomaly_weight: 0.10,
+            // Focus overall_score purely on statistical fidelity (which already
+            // includes account-class proportion metrics), and ignore the other
+            // dimensions in the aggregate score. The per-dimension fields are
+            // still reported in FidelityReport.details for diagnostics.
+            statistical_weight: 1.0,
+            correlation_weight: 0.0,
+            schema_weight: 0.0,
+            rule_weight: 0.0,
+            anomaly_weight: 0.0,
         }
     }
 }

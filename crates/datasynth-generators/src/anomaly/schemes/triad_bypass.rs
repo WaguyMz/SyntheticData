@@ -54,6 +54,9 @@ pub struct TriadBypassScheme {
     reuses_this_month: u32,
     /// (year, month) of the last bypass month accounting.
     last_bypass_month: Option<(i32, u32)>,
+    /// Total number of times this invoice has been reused across the whole scheme lifecycle.
+    /// Capped so that a given invoice is never reused more than a small, realistic number of times.
+    total_reuses: u32,
 }
 
 impl TriadBypassScheme {
@@ -113,6 +116,7 @@ impl TriadBypassScheme {
             reused_vendor_id: None,
             reuses_this_month: 0,
             last_bypass_month: None,
+            total_reuses: 0,
         }
     }
 
@@ -230,12 +234,25 @@ impl FraudScheme for TriadBypassScheme {
                 // nothing to emit
             }
 
-            // Stage 1: bypass — 2–4 reuses per calendar month
+            // Stage 1: bypass — 2–4 reuses per calendar month, but at most 5 total reuses of a given invoice.
             1 => {
                 // Reset monthly counter on new month
                 if self.last_bypass_month != Some(current_month) {
+                    // Enforce a hard global cap: do not reuse the same invoice more than 5 times.
+                    let max_reuses: u32 = 5;
+                    if self.total_reuses >= max_reuses {
+                        // No more bypass actions once the invoice has been reused 5 times overall.
+                        self.last_bypass_month = Some(current_month);
+                        self.reuses_this_month = 0;
+                        return actions;
+                    }
+
                     self.last_bypass_month = Some(current_month);
-                    let target = rng.random_range(2u32..=4u32);
+                    let mut target = rng.random_range(2u32..=4u32);
+                    let remaining = max_reuses.saturating_sub(self.total_reuses);
+                    if target > remaining {
+                        target = remaining;
+                    }
                     self.reuses_this_month = 0;
                     // Emit all reuses for this month on first advance of the month.
                     // Use slightly different posting dates within the month so that
@@ -279,6 +296,7 @@ impl FraudScheme for TriadBypassScheme {
                         }
 
                         self.reuses_this_month += 1;
+                        self.total_reuses += 1;
                         self.stage_transaction_count += 1;
                         self.detection_probability =
                             (self.detection_probability + 0.02).min(0.9);

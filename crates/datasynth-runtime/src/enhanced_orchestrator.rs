@@ -6435,8 +6435,14 @@ impl EnhancedOrchestrator {
             scheme_circular_funding_probability: Some(schemes.circular_funding.probability),
             scheme_phantom_warehousing_probability: Some(schemes.phantom_warehousing.probability),
             scheme_intercompany_wash_trade_probability: Some(schemes.intercompany_wash_trade.probability),
+            scheme_payroll_tax_diversion_probability: Some(schemes.payroll_tax_diversion.probability),
+            scheme_inventory_manipulation_probability: Some(schemes.inventory_manipulation.probability),
+            scheme_related_party_abuse_probability: Some(schemes.related_party_abuse.probability),
+            scheme_circular_cash_flow_probability: Some(schemes.circular_cash_flow.probability),
             max_concurrent_schemes: Some(schemes.max_concurrent_schemes),
             allow_repeat_perpetrators: Some(schemes.allow_repeat_perpetrators),
+            perpetrator_reuse_probability: Some(schemes.perpetrator_reuse_probability),
+            max_schemes_per_perpetrator: Some(schemes.max_schemes_per_perpetrator),
             correlated_injection_enabled: ai.correlated_injection.enabled,
             temporal_clustering_enabled: ai.correlated_injection.temporal_clustering,
             period_end_multiplier: ai.correlated_injection.temporal_clustering_config.period_end_multiplier,
@@ -7071,6 +7077,49 @@ impl EnhancedOrchestrator {
                     };
                     (debit, credit)
                 }
+                // Embezzlement invoice: Dr Expense (rotating class 6), Cr AP
+                SchemeActionType::EmbezzleInvoice => {
+                    if is_pcg {
+                        let salami_debit = if (action.action_id.as_u128() % 2) == 0 {
+                            pcg::expense_accounts::OFFICE_SUPPLIES
+                        } else {
+                            pcg::expense_accounts::MAINTENANCE
+                        };
+                        (salami_debit, ap.as_str())
+                    } else {
+                        (expense.as_str(), ap.as_str())
+                    }
+                }
+                // Embezzlement payment: Dr AP, Cr Bank
+                SchemeActionType::EmbezzlePayment => (ap.as_str(), bank.as_str()),
+                // Kickback partial payment: Dr AP, Cr Bank
+                SchemeActionType::PayInflatedInvoicePartial => (ap.as_str(), bank.as_str()),
+                // Payroll tax diversion
+                SchemeActionType::SuppressRemittance => (default_debit, default_credit),
+                SchemeActionType::ConcealRemittance => {
+                    if is_pcg { ("431000", suspense.as_str()) } else { (default_debit, default_credit) }
+                }
+                // Inventory manipulation
+                SchemeActionType::FictitiousGoodsReceipt => {
+                    if is_pcg { ("370000", "603000") } else { (default_debit, default_credit) }
+                }
+                SchemeActionType::InventoryWriteOff => {
+                    if is_pcg { ("685000", "370000") } else { (default_debit, default_credit) }
+                }
+                // Related-party transaction: normal procurement accounts
+                SchemeActionType::RelatedPartyProcurement => {
+                    if is_pcg { (kickback_expense_debit.as_str(), ap.as_str()) } else { (expense.as_str(), ap.as_str()) }
+                }
+                // Circular cash flow
+                SchemeActionType::FakeCashReceipt => (bank.as_str(), suspense.as_str()),
+                SchemeActionType::ClearARViaSuspense => (suspense.as_str(), ar.as_str()),
+                SchemeActionType::ConcealAsBadDebt => {
+                    if is_pcg { ("654000", bank.as_str()) } else { (expense.as_str(), bank.as_str()) }
+                }
+                // Concealment patterns
+                SchemeActionType::ConcealReclassify => (suspense.as_str(), expense.as_str()),
+                SchemeActionType::ConcealContraEntry => (expense.as_str(), suspense.as_str()),
+                SchemeActionType::ConcealContraReverse => (suspense.as_str(), expense.as_str()),
             };
 
             let posting_date = action.target_date;
@@ -7086,6 +7135,18 @@ impl EnhancedOrchestrator {
             let mut entry = JournalEntry::new(header);
             if let Some(ref ref_str) = action.reference {
                 entry.header.reference = Some(ref_str.clone());
+            }
+
+            if let Some(ref uid) = action.user_id {
+                entry.header.created_by = uid.clone();
+                entry.header.user_persona = "manual_user".to_string();
+                entry.header.source = datasynth_core::TransactionSource::Manual;
+            }
+
+            if let Some(time) = action.target_time {
+                let naive_dt = action.target_date.and_time(time);
+                entry.header.created_at =
+                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc);
             }
 
             // All scheme-materialized entries are, by construction, part of a fraud scenario.
@@ -7383,7 +7444,8 @@ impl EnhancedOrchestrator {
                     );
                     entry.add_line(with_aux(line_ap, &ap));
                 }
-                // Expense laundering §7.1 Step 1 (SuspenseStaging): Dr 628000 (net), Dr 445660 (VAT), Cr 471000.
+                // Expense laundering Step 1 (SuspenseStaging): Dr 628000 (net), Dr 445660 (VAT), Cr 401000 (AP).
+                // Routes through normal AP like a legitimate vendor invoice so 471000 is not a fraud-only signal.
                 SchemeActionType::SuspenseStaging => {
                     if is_pcg {
                         let one_point_two = Decimal::new(120, 2);
@@ -7404,40 +7466,9 @@ impl EnhancedOrchestrator {
                             vat,
                         ));
                         line_no += 1;
-                        entry.add_line(JournalEntryLine::credit(
-                            action.scheme_id,
-                            line_no,
-                            pcg::suspense_accounts::GENERAL_SUSPENSE.to_string(),
-                            amount,
-                        ));
-                    } else {
-                        entry.add_line(JournalEntryLine::debit(
-                            action.scheme_id,
-                            1,
-                            debit_acct.to_string(),
-                            amount,
-                        ));
-                        entry.add_line(JournalEntryLine::credit(
-                            action.scheme_id,
-                            2,
-                            credit_acct.to_string(),
-                            amount,
-                        ));
-                    }
-                }
-                // Expense laundering §7.1 Step 2 (SuspenseClearance): Dr 471000, Cr 401000 (2 days later).
-                SchemeActionType::SuspenseClearance => {
-                    if is_pcg {
-                        let line_dr = JournalEntryLine::debit(
-                            action.scheme_id,
-                            1,
-                            pcg::suspense_accounts::GENERAL_SUSPENSE.to_string(),
-                            amount,
-                        );
-                        entry.add_line(line_dr);
                         let line_ap = JournalEntryLine::credit(
                             action.scheme_id,
-                            2,
+                            line_no,
                             ap.clone(),
                             amount,
                         );
@@ -7449,10 +7480,43 @@ impl EnhancedOrchestrator {
                             debit_acct.to_string(),
                             amount,
                         ));
+                        let line_ap = JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            ap.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, &ap));
+                    }
+                }
+                // Expense laundering Step 2 (SuspenseClearance): Dr 401000 (AP), Cr 512000 (Bank).
+                // Looks like a normal vendor payment — no 471000 suspense involved.
+                SchemeActionType::SuspenseClearance => {
+                    if is_pcg {
+                        let line_ap = JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            ap.clone(),
+                            amount,
+                        );
+                        entry.add_line(with_aux(line_ap, &ap));
                         entry.add_line(JournalEntryLine::credit(
                             action.scheme_id,
                             2,
-                            credit_acct.to_string(),
+                            bank.clone(),
+                            amount,
+                        ));
+                    } else {
+                        entry.add_line(JournalEntryLine::debit(
+                            action.scheme_id,
+                            1,
+                            ap.clone(),
+                            amount,
+                        ));
+                        entry.add_line(JournalEntryLine::credit(
+                            action.scheme_id,
+                            2,
+                            bank.clone(),
                             amount,
                         ));
                     }
@@ -7670,6 +7734,43 @@ impl EnhancedOrchestrator {
                             amount,
                         ));
                     }
+                }
+                // Embezzlement invoice: Dr Expense + Dr VAT, Cr AP with lettrage
+                SchemeActionType::EmbezzleInvoice if is_pcg => {
+                    let one_point_two = Decimal::new(120, 2);
+                    let net = amount / one_point_two;
+                    let vat = amount - net;
+                    let lettrage_code = action.reference.clone().map(|r| format!("L-{}", &r[r.len().saturating_sub(6)..]));
+                    let mut line_no = 1;
+                    entry.add_line(JournalEntryLine::debit(
+                        action.scheme_id, line_no, debit_acct.to_string(), net,
+                    ));
+                    line_no += 1;
+                    entry.add_line(JournalEntryLine::debit(
+                        action.scheme_id, line_no, pcg::tax_accounts::INPUT_VAT.to_string(), vat,
+                    ));
+                    line_no += 1;
+                    let mut ap_line = with_aux(
+                        JournalEntryLine::credit(action.scheme_id, line_no, ap.clone(), amount),
+                        ap.as_str(),
+                    );
+                    ap_line.lettrage = lettrage_code;
+                    ap_line.lettrage_date = Some(action.target_date);
+                    entry.add_line(ap_line);
+                }
+                // Embezzlement payment: Dr AP (with lettrage), Cr Bank
+                SchemeActionType::EmbezzlePayment if is_pcg => {
+                    let lettrage_code = action.reference.clone().map(|r| format!("L-{}", &r[r.len().saturating_sub(6)..]));
+                    let mut ap_line = with_aux(
+                        JournalEntryLine::debit(action.scheme_id, 1, ap.clone(), amount),
+                        ap.as_str(),
+                    );
+                    ap_line.lettrage = lettrage_code;
+                    ap_line.lettrage_date = Some(action.target_date);
+                    entry.add_line(ap_line);
+                    entry.add_line(JournalEntryLine::credit(
+                        action.scheme_id, 2, bank.clone(), amount,
+                    ));
                 }
                 // Default: a simple 2-line balanced entry (generic accounts).
                 _ => {

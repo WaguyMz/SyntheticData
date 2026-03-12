@@ -93,10 +93,18 @@ pub struct EnhancedInjectionConfig {
     pub scheme_circular_funding_probability: Option<f64>,
     pub scheme_phantom_warehousing_probability: Option<f64>,
     pub scheme_intercompany_wash_trade_probability: Option<f64>,
+    pub scheme_payroll_tax_diversion_probability: Option<f64>,
+    pub scheme_inventory_manipulation_probability: Option<f64>,
+    pub scheme_related_party_abuse_probability: Option<f64>,
+    pub scheme_circular_cash_flow_probability: Option<f64>,
     /// Maximum concurrent schemes.
     pub max_concurrent_schemes: Option<usize>,
     /// Whether to allow repeat perpetrators.
     pub allow_repeat_perpetrators: Option<bool>,
+    /// Probability of reusing an active perpetrator for a new scheme.
+    pub perpetrator_reuse_probability: Option<f64>,
+    /// Max schemes per perpetrator when reuse is active.
+    pub max_schemes_per_perpetrator: Option<usize>,
     /// Enable correlated anomaly injection.
     pub correlated_injection_enabled: bool,
     /// Enable temporal clustering (period-end spikes).
@@ -321,10 +329,35 @@ impl AnomalyInjector {
                     .enhanced
                     .max_concurrent_schemes
                     .unwrap_or(5),
+                payroll_tax_diversion_probability: config
+                    .enhanced
+                    .scheme_payroll_tax_diversion_probability
+                    .unwrap_or(default_scheme_p),
+                inventory_manipulation_probability: config
+                    .enhanced
+                    .scheme_inventory_manipulation_probability
+                    .unwrap_or(default_scheme_p),
+                related_party_abuse_probability: config
+                    .enhanced
+                    .scheme_related_party_abuse_probability
+                    .unwrap_or(default_scheme_p),
+                circular_cash_flow_probability: config
+                    .enhanced
+                    .scheme_circular_cash_flow_probability
+                    .unwrap_or(default_scheme_p),
                 allow_repeat_perpetrators: config
                     .enhanced
                     .allow_repeat_perpetrators
                     .unwrap_or(false),
+                perpetrator_reuse_probability: config
+                    .enhanced
+                    .perpetrator_reuse_probability
+                    .unwrap_or(0.0),
+                max_schemes_per_perpetrator: config
+                    .enhanced
+                    .max_schemes_per_perpetrator
+                    .unwrap_or(3),
+                co_occurrence: std::collections::HashMap::new(),
                 seed: rng.random(),
             };
             Some(SchemeAdvancer::new(scheme_config))
@@ -599,6 +632,10 @@ impl AnomalyInjector {
             ExpenseReimbursement => FraudType::AssetMisappropriation,
             InventoryTheft => FraudType::InventoryTheft,
             Custom => FraudType::FictitiousTransaction,
+            PayrollTaxDiversion => FraudType::AssetMisappropriation,
+            InventoryManipulation => FraudType::InventoryTheft,
+            RelatedPartyAbuse => FraudType::Kickback,
+            CircularCashFlow => FraudType::SuspenseAccountAbuse,
         };
         // Use a synthetic scheme document per action so each scheme action
         // (stage/date) has its own document id in the viewer.

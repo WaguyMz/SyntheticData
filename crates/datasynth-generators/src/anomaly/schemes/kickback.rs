@@ -46,8 +46,12 @@ pub struct VendorKickbackScheme {
     transactions: Vec<SchemeTransactionRef>,
     /// Total impact (inflated amounts).
     total_impact: Decimal,
-    /// Total kickback payments.
+    /// Total kickback payments emitted so far.
     total_kickbacks: Decimal,
+    /// Whether at least one kickback payment (stage 3/4) has been emitted.
+    has_emitted_kickback: bool,
+    /// Number of explicit kickback JEs emitted in stage 3/4 (cap with stage.transaction_count_max).
+    kickback_payment_count: u32,
     /// Status.
     status: SchemeStatus,
     /// Detection status.
@@ -98,7 +102,8 @@ impl VendorKickbackScheme {
                 "price_inflation",
                 12,
                 (dec!(5000), dec!(100000)),
-                (2, 4),
+                // Fewer inflated invoices per scheme so JE counts stay closer to ground truth per vendor.
+                (1, 2),
                 AnomalyDetectionDifficulty::Hard,
             )
             .with_description("Inflate invoice amounts 10-25%")
@@ -110,7 +115,8 @@ impl VendorKickbackScheme {
                 "kickback_payments",
                 6,
                 (dec!(500), dec!(25000)),
-                (1, 3),
+                // Exactly one explicit kickback payment JE per scheme by default.
+                (1, 1),
                 AnomalyDetectionDifficulty::Moderate,
             )
             .with_description("Receive kickback payments from vendor")
@@ -140,6 +146,8 @@ impl VendorKickbackScheme {
             transactions: Vec::new(),
             total_impact: Decimal::ZERO,
             total_kickbacks: Decimal::ZERO,
+            has_emitted_kickback: false,
+            kickback_payment_count: 0,
             status: SchemeStatus::NotStarted,
             detection_status: SchemeDetectionStatus::Undetected,
             detection_probability: 0.0,
@@ -364,7 +372,9 @@ impl FraudScheme for VendorKickbackScheme {
             self.advance_stage();
         }
 
-        let stage = &self.stages[self.current_stage_index];
+        // Clone current stage so we can freely mutate self later (record_transaction)
+        // without running into Rust's borrow checker for &self.stages[..].
+        let stage = self.stages[self.current_stage_index].clone();
 
         // Generate actions based on stage
         match self.current_stage_index {
@@ -389,7 +399,10 @@ impl FraudScheme for VendorKickbackScheme {
             1 => {
                 // Price inflation stage — full P2P cycle: inflated invoice (billing) + payment with VAT.
                 // Base amount = vendor's "usual" order; total_amount = inflated gross (what company pays).
-                if rng.random::<f64>() < self.inflation_action_probability {
+                // Respect stage.transaction_count_max so we don't flood schemes with hundreds of invoices.
+                if self.inflated_transaction_count < stage.transaction_count_max
+                    && rng.random::<f64>() < self.inflation_action_probability
+                {
                     // Use fingerprint distribution so inflated amounts stay in-distribution (not easy outliers)
                     let base_amount = context
                         .sample_amount_from_fingerprint(rng, Some("6XXX"))
@@ -425,6 +438,17 @@ impl FraudScheme for VendorKickbackScheme {
                         base_amount, inflation, total_amount
                     ));
 
+                    // Treat the inflation portion as the scheme's financial impact so that
+                    // later kickback stages (3/4) have a non-zero total_impact to work from.
+                    let tx_ref = SchemeTransactionRef::new(
+                        invoice_ref.clone(),
+                        context.current_date,
+                        inflation,
+                        stage.stage_number,
+                    )
+                    .with_action(inv_action.action_id);
+                    self.record_transaction(tx_ref);
+
                     for technique in &stage.concealment_techniques {
                         inv_action = inv_action.with_technique(*technique);
                     }
@@ -432,32 +456,27 @@ impl FraudScheme for VendorKickbackScheme {
                     self.inflated_transaction_count += 1;
                     actions.push(inv_action);
 
-                    // 2) Spec §4.2: Split payment into 2 or 3 separate JEs on different dates (T+10, T+15, T+20).
-                    // Same reference on all payments for partial lettrage until final payment.
-                    let num_parts = if (self.scheme_id.as_u128() + self.inflated_transaction_count as u128) % 3 == 0 {
-                        3
+                    // 2) Split payment into 2-3 partial payments at T+10, T+15, T+20
+                    let n_parts = rng.random_range(2u32..=3);
+                    let splits: Vec<f64> = if n_parts == 2 {
+                        vec![0.60, 0.40]
                     } else {
-                        2
+                        vec![0.50, 0.30, 0.20]
                     };
-                    let parts: Vec<(i64, Decimal)> = if num_parts == 2 {
-                        let p1 = (total_amount * Decimal::new(60, 2)).round_dp(2);
-                        let p2 = total_amount - p1;
-                        vec![(10, p1), (20, p2)]
-                    } else {
-                        let third = (total_amount / Decimal::from(3u32)).round_dp(2);
-                        let two_thirds = third * Decimal::from(2u32);
-                        let remainder = total_amount - two_thirds;
-                        vec![(10, third), (15, third), (20, remainder)]
-                    };
-                    for (i, (days_offset, part_amount)) in parts.into_iter().enumerate() {
+                    let offsets: Vec<i64> = vec![10, 15, 20];
+                    for (i, (frac, days_offset)) in splits.iter().zip(offsets.iter()).enumerate() {
+                        let part_amount = Decimal::from_f64_retain(
+                            f64::try_from(total_amount).unwrap_or(1000.0) * frac
+                        ).unwrap_or(total_amount / Decimal::from(n_parts));
                         if part_amount <= Decimal::ZERO {
                             continue;
                         }
-                        let payment_date = context.current_date + chrono::Duration::days(days_offset);
+                        let payment_date =
+                            context.current_date + chrono::Duration::days(*days_offset);
                         let mut pay_action = SchemeAction::new(
                             self.scheme_id,
                             stage.stage_number,
-                            SchemeActionType::MakeKickbackPayment,
+                            SchemeActionType::PayInflatedInvoicePartial,
                             payment_date,
                         )
                         .with_scheme_type(self.scheme_type())
@@ -467,9 +486,8 @@ impl FraudScheme for VendorKickbackScheme {
                         .with_difficulty(stage.detection_difficulty)
                         .with_reference(&invoice_ref)
                         .with_description(format!(
-                            "Payment {} of inflated invoice {} (P2P)",
-                            i + 1,
-                            invoice_ref
+                            "Partial payment {}/{} of inflated invoice {} (P2P)",
+                            i + 1, n_parts, invoice_ref
                         ));
 
                         for technique in &stage.concealment_techniques {
@@ -482,7 +500,15 @@ impl FraudScheme for VendorKickbackScheme {
             }
             2 => {
                 // Kickback payment stage — amount = vendor's usual (base) amount × configurable amount_shift_percent (commission).
-                if self.total_impact > Decimal::ZERO && rng.random::<f64>() < 0.15 {
+                // Guarantee at least one kickback payment per scheme whenever total_impact > 0,
+                // then fall back to probabilistic emissions (15%) for any additional payments,
+                // but never exceed stage.transaction_count_max payments.
+                if self.total_impact > Decimal::ZERO
+                    && self.kickback_payment_count < stage.transaction_count_max
+                {
+                    let must_emit_once = !self.has_emitted_kickback;
+                    let should_emit = must_emit_once || rng.random::<f64>() < 0.15;
+                    if should_emit {
                     let usual_amount = self.vendor_typical_base_amount.unwrap_or_else(|| {
                         let min_f = self.vendor_typical_amount_min.try_into().unwrap_or(5000.0);
                         let max_f = self.vendor_typical_amount_max.try_into().unwrap_or(50000.0);
@@ -519,9 +545,12 @@ impl FraudScheme for VendorKickbackScheme {
                         }
 
                         self.total_kickbacks += kickback_amount;
+                        self.has_emitted_kickback = true;
+                        self.kickback_payment_count += 1;
                         actions.push(action);
                     }
                 }
+            }
             }
             3 => {
                 // Concealment stage

@@ -405,6 +405,26 @@ impl FraudScheme for ShadowPayrollScheme {
         self.total_impact += transaction.amount;
         self.transactions.push(transaction);
     }
+
+    fn ghost_employees(&self) -> Vec<super::scheme::GhostEmployeeRecord> {
+        if !self.hire_emitted {
+            return Vec::new();
+        }
+        let ghost_name = format!(
+            "Employee {}",
+            &self.ghost_employee_id[4..] // strip "EMP-" prefix
+        );
+        vec![super::scheme::GhostEmployeeRecord {
+            employee_id: self.ghost_employee_id.clone(),
+            display_name: ghost_name,
+            hire_date: self.start_date.unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
+            cost_center: None,
+            payroll_account_number: None,
+            manager_id: None,
+            perpetrator_id: self.perpetrator_id.clone(),
+            scheme_id: self.scheme_id,
+        }]
+    }
 }
 
 #[cfg(test)]

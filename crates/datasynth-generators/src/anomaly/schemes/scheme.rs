@@ -1,6 +1,6 @@
 //! Core fraud scheme trait and types.
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, NaiveTime};
 use rand::Rng;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,10 @@ pub struct SchemeContext {
     pub candidate_invoice_ids: Vec<String>,
     /// Per-account-class amount configs from fingerprint so fraud amounts stay in-distribution (not easy outliers).
     pub fingerprint_amount_configs: Option<std::collections::HashMap<String, datasynth_core::AmountDistributionConfig>>,
+    /// Whether this period falls in a holiday / reduced oversight window.
+    pub is_holiday_period: bool,
+    /// Days remaining until fiscal year-end (0 on last day).
+    pub days_to_fiscal_year_end: i32,
 }
 
 impl SchemeContext {
@@ -148,6 +152,8 @@ impl SchemeContext {
             annual_revenue: None,
             candidate_invoice_ids: Vec::new(),
             fingerprint_amount_configs: None,
+            is_holiday_period: false,
+            days_to_fiscal_year_end: 365,
         }
     }
 
@@ -260,6 +266,9 @@ pub struct SchemeAction {
     /// Optional reference (e.g. invoice number) to link related actions (invoice + payment).
     #[serde(default)]
     pub reference: Option<String>,
+    /// Target time of day for the JE (e.g. after-hours for embezzlement Stage 0/1).
+    #[serde(default)]
+    pub target_time: Option<NaiveTime>,
 }
 
 impl SchemeAction {
@@ -316,12 +325,19 @@ impl SchemeAction {
             executed: false,
             company_code: None,
             reference: None,
+            target_time: None,
         }
     }
 
     /// Sets the reference (e.g. invoice number for P2P linking).
     pub fn with_reference(mut self, reference: impl Into<String>) -> Self {
         self.reference = Some(reference.into());
+        self
+    }
+
+    /// Sets the target time of day for this action's JE.
+    pub fn with_target_time(mut self, time: NaiveTime) -> Self {
+        self.target_time = Some(time);
         self
     }
 
@@ -440,6 +456,51 @@ pub enum SchemeActionType {
     // Triad bypass
     /// Concealment correcting reversals.
     BypassConcealment,
+    // Embezzlement paired invoice+payment
+    /// Embezzlement invoice (Dr Expense, Cr AP).
+    EmbezzleInvoice,
+    /// Embezzlement payment (Dr AP, Cr Bank), scheduled T+15..T+30 after invoice.
+    EmbezzlePayment,
+    // Kickback split payments
+    /// Partial payment of an inflated invoice (Dr AP, Cr Bank).
+    PayInflatedInvoicePartial,
+    // New scheme types (Tier 3)
+    /// Payroll tax diversion: suppress expected remittance.
+    SuppressRemittance,
+    /// Payroll tax diversion: conceal via suspense instead of bank.
+    ConcealRemittance,
+    /// Inventory manipulation: fictitious goods receipt.
+    FictitiousGoodsReceipt,
+    /// Inventory manipulation: write-off as shrinkage.
+    InventoryWriteOff,
+    /// Related-party transaction: procurement through related vendor.
+    RelatedPartyProcurement,
+    /// Circular cash flow: fake cash receipt via suspense.
+    FakeCashReceipt,
+    /// Circular cash flow: clear AR via suspense.
+    ClearARViaSuspense,
+    /// Circular cash flow: conceal reversal as bad debt.
+    ConcealAsBadDebt,
+    // Concealment patterns
+    /// Reclassify suspicious balance to less-scrutinised account.
+    ConcealReclassify,
+    /// Contra-entry: create offsetting entry within a period.
+    ConcealContraEntry,
+    /// Reverse a contra-entry in the next period.
+    ConcealContraReverse,
+}
+
+/// A ghost employee record to be merged into master data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GhostEmployeeRecord {
+    pub employee_id: String,
+    pub display_name: String,
+    pub hire_date: NaiveDate,
+    pub cost_center: Option<String>,
+    pub payroll_account_number: Option<String>,
+    pub manager_id: Option<String>,
+    pub perpetrator_id: String,
+    pub scheme_id: Uuid,
 }
 
 /// Trait for fraud schemes.
@@ -492,6 +553,11 @@ pub trait FraudScheme: Send + Sync {
 
     /// Records a transaction.
     fn record_transaction(&mut self, transaction: SchemeTransactionRef);
+
+    /// Returns ghost employee records to merge into master data (default: none).
+    fn ghost_employees(&self) -> Vec<GhostEmployeeRecord> {
+        Vec::new()
+    }
 }
 
 /// Reference to a transaction within a scheme.

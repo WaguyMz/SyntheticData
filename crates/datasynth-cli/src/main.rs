@@ -1279,10 +1279,14 @@ fn main() -> Result<()> {
                                     println!("=================================================");
                                     println!("  Overall:        {:.1}%", report.overall_score * 100.0);
                                     println!("  Statistical:   {:.1}%", report.statistical_fidelity * 100.0);
-                                    println!("  Correlation:   {:.1}%", report.correlation_fidelity * 100.0);
-                                    println!("  Schema:        {:.1}%", report.schema_fidelity * 100.0);
-                                    println!("  Rule:          {:.1}%", report.rule_compliance * 100.0);
-                                    println!("  Anomaly:       {:.1}%", report.anomaly_fidelity * 100.0);
+                                    if let Some(mad) =
+                                        report.details.account_class_proportion_mad
+                                    {
+                                        println!(
+                                            "  Account-class mix MAD: {:.4}",
+                                            mad
+                                        );
+                                    }
                                     println!("  Pass:          {}", if report.passes { "yes" } else { "no" });
                                     println!();
                                     let report_path = output.join("fingerprint_fidelity_report.json");
